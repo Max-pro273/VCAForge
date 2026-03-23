@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 import castep_io
-from castep_io import param_smart_defaults, validate_vca_pair
+from castep_io import ACTIVE_ENGINE, param_smart_defaults, validate_vca_pair
 from workflow import (
     DONE,
     FAILED,
@@ -35,9 +35,6 @@ from workflow import (
 
 VERSION = "5.1"
 
-DEFAULT_CASTEP_BIN = (
-    "~/Applications/CASTEP-25.12_2/bin/linux_x86_64_gfortran10--mpi/castep.mpi"
-)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-level input helpers
@@ -117,8 +114,15 @@ _TASKS = [
 ]
 
 _XC_FUNCTIONALS = [
-    "PBE", "PBEsol", "WC", "PW91", "RPBE",
-    "LDA", "RSCAN", "PBE0", "HSE06",
+    "PBE",
+    "PBEsol",
+    "WC",
+    "PW91",
+    "RPBE",
+    "LDA",
+    "RSCAN",
+    "PBE0",
+    "HSE06",
 ]
 
 
@@ -166,7 +170,9 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     else:
         print("  │  500 eV — production quality for metals/alloys")
         print("  │  700 eV — mandatory for hard elements (C, N, O, F)")
-    raw_cutoff = ask_str(f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff))
+    raw_cutoff = ask_str(
+        f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff)
+    )
     try:
         cut_off_energy = max(int(float(raw_cutoff.split()[0])), 100)
     except ValueError:
@@ -194,7 +200,9 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     print(f"  ℹ  nextra_bands : {nextra_bands}  (auto-selected for this system)")
     print()
 
-    castep_io.write_param(param_path, task, xc, cut_off_energy, spin_polarized, nextra_bands)
+    castep_io.write_param(
+        param_path, task, xc, cut_off_energy, spin_polarized, nextra_bands
+    )
     print(f"  ✓ Written: {param_path.name}")
     return param_path
 
@@ -221,9 +229,7 @@ def _warn_cell_size(cell_path: Path) -> None:
         )
 
 
-def wizard_species(
-    cell_path: Path, cli_species: list[str] | None
-) -> tuple[str, str]:
+def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str, str]:
     """
     Determine (species_a, species_b) pair for a VCA sweep.
 
@@ -258,7 +264,9 @@ def wizard_species(
     print("  x=0 → pure A (the element you substitute FROM)")
     print("  x=1 → pure B (the element you substitute TO)")
     print("  All other sublattices (e.g. C in TiC) stay unchanged.")
-    print("  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc.")
+    print(
+        "  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc."
+    )
 
     while True:
         default_a = found_species[0] if found_species else ""
@@ -269,7 +277,9 @@ def wizard_species(
             print("  ⚠  Required.")
             continue
         if species_a not in found_species:
-            print(f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})")
+            print(
+                f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})"
+            )
             continue
 
         raw_b = ask_str(f"  Replace {species_a} with (or same for single-compound): ")
@@ -281,7 +291,9 @@ def wizard_species(
 
         # A == B → signal single_mode by returning identical pair; main.py detects this
         if species_a == species_b:
-            print(f"  ℹ  A == B ({species_a}) → will run as single-compound calculation.")
+            print(
+                f"  ℹ  A == B ({species_a}) → will run as single-compound calculation."
+            )
             _warn_cell_size(cell_path)
             return species_a, species_b
 
@@ -309,12 +321,14 @@ def wizard_species(
 
 def wizard_castep_cmd(override: str | None) -> str:
     """
-    Resolve the CASTEP MPI command string.
+    Resolve the engine MPI command string.
     Prompts for MPI process count, then validates the binary exists.
     Returns empty string for prepare-only mode.
+    The default binary and command template come from ACTIVE_ENGINE in castep_io.py.
     """
+    engine = ACTIVE_ENGINE
     cpu_count = multiprocessing.cpu_count()
-    print("\n── Parallelisation ──")
+    print(f"\n── {engine.name} — Parallelisation ──")
     print(f"  This machine: {cpu_count} logical cores")
     default_cores = min(cpu_count, 6)
     raw_cores = ask_str(f"MPI processes [{default_cores}]: ", str(default_cores))
@@ -326,10 +340,11 @@ def wizard_castep_cmd(override: str | None) -> str:
     if override:
         cmd = override.replace("{ncores}", str(n_cores))
     else:
-        cmd = f"mpirun -n {n_cores} {DEFAULT_CASTEP_BIN} {{seed}}"
+        bin_path = os.path.expanduser(engine.default_bin)
+        cmd = engine.cmd_template.format(bin=bin_path, ncores=n_cores, seed="{seed}")
 
     cmd = os.path.expanduser(cmd.replace("{ncores}", str(n_cores)))
-    print(f"\n── CASTEP command ──\n  {cmd}")
+    print(f"\n── {engine.name} command ──\n  {cmd}")
 
     binary_part = cmd.replace("{seed}", "").strip()
     if cmd_is_valid(binary_part):
@@ -401,7 +416,8 @@ def print_step_result(
     # FAILED
     print(f"  └─ ✗ FAILED (rc={step.rc})")
     useful_stderr = [
-        line for line in exec_result.stderr_tail
+        line
+        for line in exec_result.stderr_tail
         if line.strip() and "PMIX" not in line and not line.startswith("[")
     ][-5:]
     for line in useful_stderr:
@@ -411,8 +427,12 @@ def print_step_result(
     if castep_log.exists():
         all_lines = castep_log.read_text(errors="replace").splitlines()
         error_lines = [
-            ln for ln in all_lines[-40:]
-            if any(kw in ln.lower() for kw in ("error", "abort", "fatal", "failed", "warning"))
+            ln
+            for ln in all_lines[-40:]
+            if any(
+                kw in ln.lower()
+                for kw in ("error", "abort", "fatal", "failed", "warning")
+            )
         ]
         for line in error_lines[-4:]:
             print(f"     │ {line.strip()}")
@@ -449,7 +469,9 @@ def print_summary(state: RunState) -> None:
         f"  {'#':>3}  {'x':>7}  {'Status':<8}  {'H (eV)':>16}"
         f"  {'a (Å)':>8}  {'B (GPa)':>7}  conv"
     )
-    print(f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}")
+    print(
+        f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}"
+    )
 
     for step in steps:
         flag = " ⚠" if step.geom_converged == "no" and step.status == DONE else ""
@@ -464,8 +486,10 @@ def print_summary(state: RunState) -> None:
             f"  {(step.geom_converged or '—')}{flag}"
         )
 
-    counts = {st: sum(1 for s in steps if s.status == st)
-              for st in (DONE, SKIPPED, FAILED, PENDING)}
+    counts = {
+        st: sum(1 for s in steps if s.status == st)
+        for st in (DONE, SKIPPED, FAILED, PENDING)
+    }
     print(f"{'═' * W}")
     print(
         f"  ✓ {counts[DONE]}  ⊘ {counts[SKIPPED]}"

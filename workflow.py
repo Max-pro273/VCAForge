@@ -28,7 +28,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from castep_io import CastepResult, nextra_for_step, parse_castep_log, patch_nextra_bands
+from castep_io import (
+    ACTIVE_ENGINE,
+    CastepResult,
+    nextra_for_step,
+    parse_castep_log,
+    patch_nextra_bands,
+)
 
 VERSION = "5.1"
 
@@ -98,8 +104,17 @@ class Step:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Step":
-        known = {"idx", "step", "concentration", "status", "step_dir",
-                 "started_at", "finished_at", "rc", "parsed"}
+        known = {
+            "idx",
+            "step",
+            "concentration",
+            "status",
+            "step_dir",
+            "started_at",
+            "finished_at",
+            "rc",
+            "parsed",
+        }
         idx = data.get("step", data.get("idx", 0))
         parsed = data.get("parsed", {})
         # Back-compat: old format stored fields directly on Step
@@ -143,7 +158,7 @@ class RunState:
     """Full persistent state for one VCA run session."""
 
     version: str
-    seed: str               # CASTEP job name (= structure stem)
+    seed: str  # CASTEP job name (= structure stem)
     proj_dir: Path
     species_a: str
     species_b: str
@@ -247,9 +262,7 @@ def new_run(
         steps = [
             Step(
                 idx=i,
-                concentration=round(
-                    c_end if i == n_steps else c_start + i * delta, 10
-                ),
+                concentration=round(c_end if i == n_steps else c_start + i * delta, 10),
             )
             for i in range(n_steps + 1)
         ]
@@ -276,8 +289,13 @@ def new_run(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CSV_FIXED_FIELDS = [
-    "step", "concentration", "status", "step_dir",
-    "started_at", "finished_at", "rc",
+    "step",
+    "concentration",
+    "status",
+    "step_dir",
+    "started_at",
+    "finished_at",
+    "rc",
 ]
 
 
@@ -333,9 +351,7 @@ def mixing_enthalpy(
     Returns list of (x, H_eV, dH_meV) sorted by x.
     Returns empty list if endpoint enthalpies are unavailable.
     """
-    done_steps = [
-        s for s in steps if s.status == DONE and s.parsed.get("enthalpy_eV")
-    ]
+    done_steps = [s for s in steps if s.status == DONE and s.parsed.get("enthalpy_eV")]
 
     try:
         h_at_zero = next(
@@ -491,8 +507,7 @@ def _run_castep_process(cmd: str, cwd: Path, castep_out: Path) -> ExecResult:
     _arm_skip_signal()
     try:
         proc = subprocess.Popen(
-            cmd, shell=True, cwd=cwd,
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            cmd, shell=True, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
         )
 
         def _drain_stderr() -> None:
@@ -581,6 +596,7 @@ def execute_step(
     # In single_mode species_b is empty — use species_a only (no VCA overhead)
     if state.single_mode or not state.species_b:
         from castep_io import nextra_for_element
+
         nextra = nextra_for_element(state.species_a)
     else:
         nextra = nextra_for_step(state.species_a, state.species_b, x)
@@ -603,7 +619,9 @@ def execute_step(
         return ExecResult(rc=0, skipped=False, stderr_tail=[])
 
     cmd = os.path.expanduser(state.castep_cmd.replace("{seed}", seed))
-    exec_result = _run_castep_process(cmd, step_dir, step_dir / f"{seed}.castep")
+    exec_result = _run_castep_process(
+        cmd, step_dir, step_dir / f"{seed}{ACTIVE_ENGINE.output_suffix}"
+    )
     step.finished_at = _now()
 
     if exec_result.skipped:
@@ -611,7 +629,9 @@ def execute_step(
         step.rc = "ctrl-c"
     else:
         step.rc = str(exec_result.rc) if exec_result.rc is not None else "unknown"
-        castep_result: CastepResult = parse_castep_log(step_dir / f"{seed}.castep")
+        castep_result: CastepResult = parse_castep_log(
+            step_dir / f"{seed}{ACTIVE_ENGINE.output_suffix}"
+        )
         # Store all parsed fields dynamically — no hardcoded field list
         step.parsed = castep_result.to_dict()
 

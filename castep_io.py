@@ -23,6 +23,65 @@ from typing import Any
 VERSION = "5.1"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Engine configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Each DFT engine has its own EngineConfig instance.
+# ui.py and workflow.py import the active engine's config
+#
+# To add a new engine (e.g. Quantum ESPRESSO):
+#   1. Create an EngineConfig instance below (QE_ENGINE).
+#   2. Write qe_io.py with the same public API:
+#        write_input(), write_params(), parse_log() → dict[str, Any]
+#   3. In main.py select the engine via --engine flag and pass its config to ui.py.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class EngineConfig:
+    """
+    All engine-specific constants in one place.
+
+    Attributes:
+        name:           Human-readable engine label shown in the UI.
+        default_bin:    Default binary path (supports ~ expansion).
+                        Used only when the user has not provided --castep-cmd.
+        cmd_template:   Full MPI command template.
+                        Placeholders: {bin} = binary path, {ncores} = MPI count,
+                        {seed} = job name (substituted at runtime by workflow.py).
+        input_suffix:   Input file extension this engine reads (.cell, .in, ...).
+        output_suffix:  Primary output file this engine writes (.castep, .out, ...).
+    """
+
+    name: str
+    default_bin: str
+    cmd_template: str
+    input_suffix: str
+    output_suffix: str
+
+
+# ── CASTEP (default) ──────────────────────────────────────────────────────────
+CASTEP_ENGINE = EngineConfig(
+    name="CASTEP",
+    default_bin=("castep.mpi"),
+    cmd_template="mpirun -n {ncores} {bin} {seed}",
+    input_suffix=".cell",
+    output_suffix=".castep",
+)
+
+# ── Example: Quantum ESPRESSO stub (uncomment + implement qe_io.py to use) ───
+# QE_ENGINE = EngineConfig(
+#     name="Quantum ESPRESSO",
+#     default_bin="~/qe-7.3/bin/pw.x",
+#     cmd_template="mpirun -n {ncores} {bin} -in {seed}.in",
+#     input_suffix=".in",
+#     output_suffix=".out",
+# )
+
+# ── Active engine — change this line to switch engines project-wide ───────────
+ACTIVE_ENGINE: EngineConfig = CASTEP_ENGINE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Element classification
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -30,21 +89,96 @@ VERSION = "5.1"
 _METALS: frozenset[str] = frozenset(
     {
         # s-block
-        "Li", "Na", "K", "Rb", "Cs", "Be", "Mg", "Ca", "Sr", "Ba", "Ra",
+        "Li",
+        "Na",
+        "K",
+        "Rb",
+        "Cs",
+        "Be",
+        "Mg",
+        "Ca",
+        "Sr",
+        "Ba",
+        "Ra",
         # d-block (transition metals)
-        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
-        "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
-        "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+        "Sc",
+        "Ti",
+        "V",
+        "Cr",
+        "Mn",
+        "Fe",
+        "Co",
+        "Ni",
+        "Cu",
+        "Zn",
+        "Y",
+        "Zr",
+        "Nb",
+        "Mo",
+        "Tc",
+        "Ru",
+        "Rh",
+        "Pd",
+        "Ag",
+        "Cd",
+        "Hf",
+        "Ta",
+        "W",
+        "Re",
+        "Os",
+        "Ir",
+        "Pt",
+        "Au",
+        "Hg",
         # p-block metals
-        "Al", "Ga", "In", "Sn", "Tl", "Pb", "Bi",
+        "Al",
+        "Ga",
+        "In",
+        "Sn",
+        "Tl",
+        "Pb",
+        "Bi",
         # f-block
-        "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy",
-        "Ho", "Er", "Tm", "Yb", "Lu", "Th", "U", "Pu",
+        "La",
+        "Ce",
+        "Pr",
+        "Nd",
+        "Pm",
+        "Sm",
+        "Eu",
+        "Gd",
+        "Tb",
+        "Dy",
+        "Ho",
+        "Er",
+        "Tm",
+        "Yb",
+        "Lu",
+        "Th",
+        "U",
+        "Pu",
     }
 )
 
 _NONMETALS: frozenset[str] = frozenset(
-    {"B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "As", "Se", "Br", "Te", "I", "At", "H"}
+    {
+        "B",
+        "C",
+        "N",
+        "O",
+        "F",
+        "Si",
+        "P",
+        "S",
+        "Cl",
+        "As",
+        "Se",
+        "Br",
+        "Te",
+        "I",
+        "At",
+        "H",
+    }
 )
 
 # Magnetic elements → spin_polarized : true
@@ -56,24 +190,90 @@ _HARD: frozenset[str] = frozenset({"C", "N", "O", "F", "B", "H"})
 # d-block elements → need nextra_bands : 20 for VCA
 _D_BLOCK: frozenset[str] = frozenset(
     {
-        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
-        "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
-        "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
+        "Sc",
+        "Ti",
+        "V",
+        "Cr",
+        "Mn",
+        "Fe",
+        "Co",
+        "Ni",
+        "Cu",
+        "Zn",
+        "Y",
+        "Zr",
+        "Nb",
+        "Mo",
+        "Tc",
+        "Ru",
+        "Rh",
+        "Pd",
+        "Ag",
+        "Cd",
+        "Hf",
+        "Ta",
+        "W",
+        "Re",
+        "Os",
+        "Ir",
+        "Pt",
+        "Au",
+        "Hg",
     }
 )
 
 # Covalent/metallic radii in Å for Vegard law scaling
 _RADIUS: dict[str, float] = {
-    "Li": 1.52, "Na": 1.86, "K": 2.27, "Mg": 1.60, "Ca": 1.97, "Sr": 2.15, "Ba": 2.22,
-    "Sc": 1.62, "Y": 1.80, "Ti": 1.47, "Zr": 1.60, "Hf": 1.59,
-    "V": 1.34, "Nb": 1.46, "Ta": 1.46, "Cr": 1.28, "Mo": 1.39, "W": 1.39,
-    "Mn": 1.32, "Re": 1.37, "Fe": 1.26, "Ru": 1.34, "Os": 1.35,
-    "Co": 1.25, "Rh": 1.34, "Ir": 1.36, "Ni": 1.24, "Pd": 1.37, "Pt": 1.39,
-    "Cu": 1.28, "Ag": 1.44, "Au": 1.44, "Zn": 1.22, "Cd": 1.49,
-    "Al": 1.43, "Ga": 1.22, "In": 1.63, "Sn": 1.41,
-    "B": 0.87, "C": 0.77, "Si": 1.17, "Ge": 1.22,
-    "N": 0.75, "P": 1.10, "As": 1.21, "Sb": 1.41,
-    "La": 1.87, "Ce": 1.82, "Gd": 1.80, "Lu": 1.74,
+    "Li": 1.52,
+    "Na": 1.86,
+    "K": 2.27,
+    "Mg": 1.60,
+    "Ca": 1.97,
+    "Sr": 2.15,
+    "Ba": 2.22,
+    "Sc": 1.62,
+    "Y": 1.80,
+    "Ti": 1.47,
+    "Zr": 1.60,
+    "Hf": 1.59,
+    "V": 1.34,
+    "Nb": 1.46,
+    "Ta": 1.46,
+    "Cr": 1.28,
+    "Mo": 1.39,
+    "W": 1.39,
+    "Mn": 1.32,
+    "Re": 1.37,
+    "Fe": 1.26,
+    "Ru": 1.34,
+    "Os": 1.35,
+    "Co": 1.25,
+    "Rh": 1.34,
+    "Ir": 1.36,
+    "Ni": 1.24,
+    "Pd": 1.37,
+    "Pt": 1.39,
+    "Cu": 1.28,
+    "Ag": 1.44,
+    "Au": 1.44,
+    "Zn": 1.22,
+    "Cd": 1.49,
+    "Al": 1.43,
+    "Ga": 1.22,
+    "In": 1.63,
+    "Sn": 1.41,
+    "B": 0.87,
+    "C": 0.77,
+    "Si": 1.17,
+    "Ge": 1.22,
+    "N": 0.75,
+    "P": 1.10,
+    "As": 1.21,
+    "Sb": 1.41,
+    "La": 1.87,
+    "Ce": 1.82,
+    "Gd": 1.80,
+    "Lu": 1.74,
 }
 
 
@@ -226,7 +426,9 @@ def is_conventional_cell(cell_path: Path) -> bool:
         for i, coord_a in enumerate(coords):
             for coord_b in coords[i + 1 :]:
                 diffs = [abs(coord_a[k] - coord_b[k]) for k in range(3)]
-                half_count = sum(1 for d in diffs if abs(d - 0.5) < 0.01 or abs(d) < 0.01)
+                half_count = sum(
+                    1 for d in diffs if abs(d - 0.5) < 0.01 or abs(d) < 0.01
+                )
                 if half_count == 3:
                     return True
     return False
@@ -435,8 +637,7 @@ def write_vca_cell(
         new_text = vegard_scale(new_text, species_a, species_b, x)
 
     header = (
-        f"# VCA  {species_a}(1-x){species_b}(x)  x={x:.6f}"
-        f"  — vca_tool v{VERSION}\n"
+        f"# VCA  {species_a}(1-x){species_b}(x)  x={x:.6f}  — vca_tool v{VERSION}\n"
     )
     dest.write_text(header + new_text, encoding="utf-8")
 
@@ -455,10 +656,10 @@ def nextra_for_element(elem: str) -> int:
     """
     element = elem.capitalize()
     if element in _D_BLOCK:
-        return 10   # pure d-metal: moderate Fermi surface
+        return 10  # pure d-metal: moderate Fermi surface
     if element in _HARD:
-        return 4    # pure nonmetal: typically gapped
-    return 6        # s/p metal
+        return 4  # pure nonmetal: typically gapped
+    return 6  # s/p metal
 
 
 def nextra_for_step(species_a: str, species_b: str, x: float) -> int:
@@ -480,7 +681,7 @@ def nextra_for_step(species_a: str, species_b: str, x: float) -> int:
     n_b = nextra_for_element(species_b)
     base = round(n_a * (1.0 - x) + n_b * x)
     if 0.01 < x < 0.99:
-        return base + 10   # VCA fractional charge overhead
+        return base + 10  # VCA fractional charge overhead
     return base
 
 
@@ -508,9 +709,7 @@ def _choose_spin(species_list: list[str]) -> bool:
     return any(s.capitalize() in _MAGNETIC for s in species_list)
 
 
-def param_smart_defaults(
-    species_list: list[str], is_vca: bool
-) -> dict[str, Any]:
+def param_smart_defaults(species_list: list[str], is_vca: bool) -> dict[str, Any]:
     """
     Return a dict of recommended .param values for the given species set.
     Called by ui.py to show the user what the program recommends.
@@ -635,22 +834,36 @@ class CastepResult:
     bulk_modulus_GPa: float | None = None
     wall_time_s: float | None = None
     geom_converged: bool = False
-    task_type: str = ""        # "GeometryOptimization" or "SinglePoint" etc.
+    task_type: str = ""  # "GeometryOptimization" or "SinglePoint" etc.
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Export all non-None fields as a flat dict for CSV/JSON serialisation."""
         result: dict[str, Any] = {}
-        result["enthalpy_eV"] = f"{self.enthalpy_eV:.6f}" if self.enthalpy_eV is not None else ""
-        result["a_opt_ang"] = f"{self.a_opt_ang:.5f}" if self.a_opt_ang is not None else ""
-        result["b_opt_ang"] = f"{self.b_opt_ang:.5f}" if self.b_opt_ang is not None else ""
-        result["c_opt_ang"] = f"{self.c_opt_ang:.5f}" if self.c_opt_ang is not None else ""
-        result["volume_ang3"] = f"{self.volume_ang3:.4f}" if self.volume_ang3 is not None else ""
-        result["density_gcm3"] = f"{self.density_gcm3:.4f}" if self.density_gcm3 is not None else ""
+        result["enthalpy_eV"] = (
+            f"{self.enthalpy_eV:.6f}" if self.enthalpy_eV is not None else ""
+        )
+        result["a_opt_ang"] = (
+            f"{self.a_opt_ang:.5f}" if self.a_opt_ang is not None else ""
+        )
+        result["b_opt_ang"] = (
+            f"{self.b_opt_ang:.5f}" if self.b_opt_ang is not None else ""
+        )
+        result["c_opt_ang"] = (
+            f"{self.c_opt_ang:.5f}" if self.c_opt_ang is not None else ""
+        )
+        result["volume_ang3"] = (
+            f"{self.volume_ang3:.4f}" if self.volume_ang3 is not None else ""
+        )
+        result["density_gcm3"] = (
+            f"{self.density_gcm3:.4f}" if self.density_gcm3 is not None else ""
+        )
         result["bulk_modulus_GPa"] = (
             f"{self.bulk_modulus_GPa:.2f}" if self.bulk_modulus_GPa is not None else ""
         )
-        result["wall_time_s"] = f"{self.wall_time_s:.1f}" if self.wall_time_s is not None else ""
+        result["wall_time_s"] = (
+            f"{self.wall_time_s:.1f}" if self.wall_time_s is not None else ""
+        )
         result["geom_converged"] = "yes" if self.geom_converged else "no"
         result["warnings"] = "; ".join(self.warnings[:3])
         return result
@@ -711,17 +924,28 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
                 result.task_type = colon_parts[-1].strip()
 
         # ── Geometry convergence ─────────────────────────────────────────────
-        if not result.geom_converged and "Geometry optimization completed successfully" in line:
+        if (
+            not result.geom_converged
+            and "Geometry optimization completed successfully" in line
+        ):
             result.geom_converged = True
 
         # ── Enthalpy: "LBFGS: Final Enthalpy     = -1.90301018E+003 eV" ──────
-        if result.enthalpy_eV is None and "Final Enthalpy" in line and "Pseudo" not in line:
+        if (
+            result.enthalpy_eV is None
+            and "Final Enthalpy" in line
+            and "Pseudo" not in line
+        ):
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 result.enthalpy_eV = _try_float(eq_parts[-1].strip().split()[0])
 
         # ── Energy fallback: "Final energy, E             =  -1902.769 eV" ───
-        if result.enthalpy_eV is None and "Final energy, E" in line and "Pseudo" not in line:
+        if (
+            result.enthalpy_eV is None
+            and "Final energy, E" in line
+            and "Pseudo" not in line
+        ):
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 result.enthalpy_eV = _try_float(eq_parts[-1].strip().split()[0])
@@ -749,7 +973,12 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
 
         # ── Density: "                    =            12.449217     g/cm^3" ──
         # Must exclude "AMU/A**3" line that appears just above it
-        if result.density_gcm3 is None and "g/cm" in line and "=" in line and "AMU" not in line:
+        if (
+            result.density_gcm3 is None
+            and "g/cm" in line
+            and "=" in line
+            and "AMU" not in line
+        ):
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 value = _try_float(eq_parts[-1].strip().split()[0])
@@ -757,7 +986,11 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
                     result.density_gcm3 = value
 
         # ── Bulk modulus: "LBFGS: Final bulk modulus = …" ────────────────────
-        if result.bulk_modulus_GPa is None and "Final bulk modulus" in line and "=" in line:
+        if (
+            result.bulk_modulus_GPa is None
+            and "Final bulk modulus" in line
+            and "=" in line
+        ):
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 result.bulk_modulus_GPa = _try_float(eq_parts[-1].strip().split()[0])
