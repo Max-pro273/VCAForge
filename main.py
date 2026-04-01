@@ -70,32 +70,34 @@ def _build_arg_parser():
     parser.add_argument("--species", nargs=2, metavar=("A", "B"))
     parser.add_argument("--range", nargs=3, metavar=("X0", "X1", "N"))
     parser.add_argument(
-        "--single",
-        action="store_true",
+        "--single", action="store_true",
         help="Single compound mode — run once, no VCA sweep",
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
+        "--resume", action="store_true",
         help="Resume the most recent run in the same folder",
     )
     parser.add_argument(
-        "--resume-dir",
-        type=Path,
-        metavar="DIR",
+        "--resume-dir", type=Path, metavar="DIR",
         help="Resume a specific project folder",
     )
     parser.add_argument(
-        "--interactive",
-        action="store_true",
+        "--interactive", action="store_true",
         help="Pause before each step for confirmation",
     )
     parser.add_argument(
-        "--keep-all",
-        action="store_true",
+        "--keep-all", action="store_true",
         help="Keep large output files (.check, .castep_bin, .bands)",
     )
     parser.add_argument("--castep-cmd", dest="castep_cmd", metavar="CMD")
+    parser.add_argument(
+        "--elastic", action="store_true",
+        help=(
+            "After GeometryOptimization, run finite-strain elastic constants workflow "
+            "(generate_strain.py + CASTEP SinglePoint × N + Cij fitting). "
+            "Requires elastic-constants-master/ next to main.py."
+        ),
+    )
     return parser
 
 
@@ -112,13 +114,13 @@ def _parse_and_validate_args(parser):
             x0 = float(args.range[0])
             x1 = float(args.range[1])
             n_steps = int(args.range[2])
-            if not (0.0 <= x0 <= 1.0 and 0.0 <= x1 <= 1.0):
-                parser.error("X0 and X1 must be in [0, 1]")
-            if n_steps < 1:
-                parser.error("N must be ≥ 1")
-            args.range = (x0, x1, n_steps)
         except ValueError:
             parser.error("--range needs two floats and one int: X0 X1 N")
+        if not (0.0 <= x0 <= 1.0 and 0.0 <= x1 <= 1.0):
+            parser.error("X0 and X1 must be in [0, 1]")
+        if n_steps < 1:
+            parser.error("N must be ≥ 1")
+        args.range = (x0, x1, n_steps)
 
     return args
 
@@ -173,9 +175,7 @@ def _find_latest_run(work_dir: Path, stem: str) -> RunState | None:
     return None
 
 
-def _try_resume(
-    work_dir: Path, stem: str, explicit_dir: Path | None
-) -> RunState | None:
+def _try_resume(work_dir: Path, stem: str, explicit_dir: Path | None) -> RunState | None:
     if explicit_dir:
         state = load_run(explicit_dir.resolve())
     else:
@@ -245,16 +245,20 @@ def _run_loop(
 
     species_a = state.species_a
     species_b = state.species_b
+    # Retrieve vacancy occupancy stored in state (set during wizard if VEC > 8.3)
+    _nm_occ = getattr(state, "nonmetal_occupancy", 1.0)
 
     def _write_cell_for_step(dest: Path, concentration: float) -> None:
-        write_vca_cell(dest, cell_src, species_a, species_b, concentration)
+        write_vca_cell(
+            dest, cell_src, species_a, species_b, concentration,
+            nonmetal_occupancy=_nm_occ,
+        )
 
     for step in steps:
         if step.status in {DONE, SKIPPED}:
             icon = workflow.STATUS_ICON[step.status]
             conv_marker = (
-                "✓"
-                if step.geom_converged == "yes"
+                "✓" if step.geom_converged == "yes"
                 else ("⚠" if step.status == DONE else "")
             )
             print(
@@ -278,7 +282,6 @@ def _run_loop(
                 step.status = SKIPPED
                 step.rc = "user-skip"
                 from datetime import datetime as _dt
-
                 now = _dt.now().isoformat(timespec="seconds")
                 step.started_at = now
                 step.finished_at = now
@@ -305,9 +308,7 @@ def _run_loop(
             keep_all=keep_all,
         )
 
-        ui.print_step_result(
-            exec_result=exec_result, step=step, proj_dir=state.proj_dir, seed=state.seed
-        )
+        ui.print_step_result(exec_result=exec_result, step=step, proj_dir=state.proj_dir, seed=state.seed)
 
         status_word = step.status.upper() if not exec_result.skipped else "SKIPPED"
         _log(
@@ -329,9 +330,7 @@ def _run_loop(
             for failed_step in failed_steps:
                 failed_step.status = PENDING
             save_run(state)
-            _run_loop(
-                state, cell_src, param_src, interactive=interactive, keep_all=keep_all
-            )
+            _run_loop(state, cell_src, param_src, interactive=interactive, keep_all=keep_all)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,18 +354,13 @@ def _run_single_compound(
     # write_cell_fn for single mode: just copy the cell verbatim
     def _copy_cell(dest: Path, _concentration: float) -> None:
         import shutil as _shutil
-
         _shutil.copy2(cell_src, dest)
 
     _log(log_path, f"Single compound: START  seed={seed}")
 
     exec_result = execute_step(  # noqa: F841  (result used via step.parsed side-effect)
-        state,
-        step,
-        cell_src,
-        param_src,
-        write_cell_fn=_copy_cell,
-        keep_all=keep_all,
+        state, step, cell_src, param_src,
+        write_cell_fn=_copy_cell, keep_all=keep_all,
     )
 
     ui.print_single_result(step, seed)
@@ -383,6 +377,241 @@ def _run_single_compound(
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Finite-strain elastic constants workflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_elastic_workflow(state: RunState, args: object) -> None:
+    """
+    Run finite-strain elastic constants (Cij) on all DONE steps.
+
+    Smart endpoint handling
+    ───────────────────────
+    Vegard interpolation requires Cij at x=0 AND x=1 as reference points.
+    If the current sweep does not include both endpoints, this function
+    checks vca_state.json for existing results and offers to compute any
+    missing endpoints automatically before the main sweep begins.
+    """
+    try:
+        from elastic_workflow import interpolate_elastic_vegard, run_finite_strain_elastic
+    except ImportError:
+        print(
+            "  ⚠  elastic_workflow.py not found.\n"
+            "     Place elastic_workflow.py and elastic_analysis.py next to main.py."
+        )
+        return
+
+    castep_cmd = state.castep_cmd
+    if not castep_cmd:
+        print("  ⚠  --elastic requires a valid CASTEP command. Skipping.")
+        return
+
+    done_steps = [s for s in state.steps if s.status == workflow.DONE]
+    print(f"\n── Elastic constants (finite-strain)  {len(done_steps)} step(s) ──")
+    print("  Using generate_strain.py + CASTEP SinglePoint × N")
+    print("  VCA intermediate x: Vegard interpolation fallback if CASTEP fails.\n")
+
+    # ── Smart endpoint check ──────────────────────────────────────────────────
+    # Collect which concentrations are done in this run
+    done_concs = {round(s.concentration, 6) for s in done_steps}
+    has_x0 = any(c < 1e-5 for c in done_concs)
+    has_x1 = any(c > 1.0 - 1e-5 for c in done_concs)
+
+    # If either endpoint is missing, check for a previous run that has it
+    def _find_endpoint_elastic(target_x: float) -> dict:
+        """Search sibling project dirs for an endpoint Cij result."""
+        work_dir = state.proj_dir.parent
+        for proj_dir in sorted(work_dir.iterdir()):
+            if not proj_dir.is_dir() or proj_dir == state.proj_dir:
+                continue
+            state_file = proj_dir / "vca_state.json"
+            if not state_file.exists():
+                continue
+            try:
+                import json as _json
+                data = _json.loads(state_file.read_text())
+                if data.get("species_a") != state.species_a:
+                    continue
+                if data.get("species_b") != state.species_b:
+                    continue
+                for step_d in data.get("steps", []):
+                    conc = step_d.get("concentration", -1)
+                    if abs(conc - target_x) < 1e-5 and step_d.get("status") == "done":
+                        parsed = step_d.get("parsed", {})
+                        if "C11" in parsed:
+                            return parsed
+            except Exception:
+                continue
+        return {}
+
+    endpoint_elastic: dict[str, dict] = {}  # "0" or "1" → parsed elastic dict
+
+    missing_endpoints: list[float] = []
+    if not has_x0:
+        cached = _find_endpoint_elastic(0.0)
+        if cached:
+            endpoint_elastic["0"] = cached
+            print(f"  ℹ  x=0.0 Cij found in previous run — using cached data.")
+        else:
+            missing_endpoints.append(0.0)
+    if not has_x1:
+        cached = _find_endpoint_elastic(1.0)
+        if cached:
+            endpoint_elastic["1"] = cached
+            print(f"  ℹ  x=1.0 Cij found in previous run — using cached data.")
+        else:
+            missing_endpoints.append(1.0)
+
+    # Offer to compute missing endpoints interactively
+    endpoint_steps_to_run: list[tuple[float, Path]] = []
+    if missing_endpoints:
+        labels = " and ".join(f"x={v:.1f}" for v in missing_endpoints)
+        print(f"  ⚠  Vegard interpolation requires pure endpoints ({labels}).")
+        print(f"     They are missing from the current sweep and all previous runs.")
+        try:
+            ans = input(f"  Compute {labels} now? [Y/n]: ").strip().lower()
+        except EOFError:
+            ans = "y"
+        if ans in {"", "y", "yes"}:
+            import shutil as _shutil
+            for ep_x in missing_endpoints:
+                ep_dir = state.proj_dir / f"x{ep_x:.4f}_ep"
+                ep_dir.mkdir(exist_ok=True)
+                # Write the pure endpoint cell + run GeomOpt
+                src_cell = state.proj_dir.parent / f"{state.seed}.cell"
+                if not src_cell.exists():
+                    # Fall back to any .cell in the project dir
+                    candidates = list(state.proj_dir.parent.glob("*.cell"))
+                    src_cell = candidates[0] if candidates else None
+                if src_cell:
+                    from castep_io import write_vca_cell
+                    ep_cell = ep_dir / f"{state.seed}.cell"
+                    write_vca_cell(ep_cell, src_cell, state.species_a, state.species_b, ep_x)
+                    ep_param = state.proj_dir.parent / f"{state.seed}.param"
+                    if ep_param.exists():
+                        _shutil.copy2(ep_param, ep_dir / f"{state.seed}.param")
+                    endpoint_steps_to_run.append((ep_x, ep_dir))
+                    print(f"  ▶  Queued x={ep_x:.1f} endpoint for GeomOpt + elastic.\n")
+                else:
+                    print(f"  ✗  Cannot find source .cell — skipping x={ep_x:.1f}")
+        else:
+            print(
+                "  Skipping endpoint computation. "
+                "Vegard interpolation will be disabled for intermediate x.\n"
+            )
+
+    # Run queued endpoint GeomOpt + elastic first
+    for ep_x, ep_dir in endpoint_steps_to_run:
+        x_label = f"x={ep_x:.4f} (endpoint)"
+        print(f"  ── {x_label} ──")
+        cmd = castep_cmd.replace("{seed}", state.seed)
+        import subprocess as _sp
+        print(f"  ▶  GeomOpt …")
+        _sp.run(cmd, shell=True, cwd=ep_dir, check=False,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        ep_data = run_finite_strain_elastic(
+            seed_dir=ep_dir,
+            seed=state.seed,
+            castep_cmd=castep_cmd,
+            keep_all=getattr(args, "keep_all", False),
+            progress_callback=lambda m: print(m),
+        )
+        key = "0" if ep_x < 0.5 else "1"
+        if ep_data and "C11" in ep_data:
+            endpoint_elastic[key] = ep_data
+            b = ep_data.get("B_Hill_GPa", "—")
+            g = ep_data.get("G_Hill_GPa", "—")
+            print(f"  ✓  {x_label}  B={b}  G={g} GPa\n")
+        else:
+            print(f"  ⚠  {x_label}  endpoint Cij failed — interpolation limited.\n")
+
+    # ── First pass: compute Cij for all steps in the sweep ───────────────────
+    elastic_results: dict[float, dict] = {}
+
+    for step in done_steps:
+        step_dir = state.proj_dir / step.step_dir
+        if not step_dir.exists():
+            continue
+
+        x = step.concentration
+        x_label = f"x={x:.4f}"
+        print(f"  ── {x_label} ──")
+
+        def _progress(msg: str, _x=x) -> None:
+            print(msg)
+
+        ep_data = run_finite_strain_elastic(
+            seed_dir=step_dir,
+            seed=state.seed,
+            castep_cmd=castep_cmd,
+            keep_all=getattr(args, "keep_all", False),
+            progress_callback=_progress,
+        )
+
+        is_failed = (
+            not ep_data
+            or "_elastic_error" in ep_data
+            or "C11" not in ep_data
+        )
+        elastic_results[x] = ep_data if not is_failed else {}
+
+        if not is_failed:
+            b = ep_data.get("B_Hill_GPa", "—")
+            g = ep_data.get("G_Hill_GPa", "—")
+            e = ep_data.get("E_GPa", "—")
+            src_tag = ep_data.get("elastic_source", "CASTEP")
+            print(f"  ✓  {x_label}  B={b} GPa  G={g} GPa  E={e} GPa  [{src_tag}]\n")
+        else:
+            err = (ep_data or {}).get("_elastic_error", "unknown error")
+            print(f"  ⚠  {x_label}  direct fit failed ({err})\n")
+
+    # ── Collect endpoint Cij for interpolation ────────────────────────────────
+    # Priority: this sweep's own results > cached from previous run > endpoint runs
+    for x, data in elastic_results.items():
+        if abs(x) < 1e-5 and data:
+            endpoint_elastic.setdefault("0", data)
+        if abs(x - 1.0) < 1e-5 and data:
+            endpoint_elastic.setdefault("1", data)
+
+    elastic_at_0 = endpoint_elastic.get("0", {})
+    elastic_at_1 = endpoint_elastic.get("1", {})
+    have_endpoints = bool(elastic_at_0 and elastic_at_1)
+
+    if not have_endpoints and any(not d for d in elastic_results.values()):
+        print(
+            "  ⚠  Vegard interpolation skipped: endpoint Cij unavailable.\n"
+            "     Run with x=0 and x=1 included, or re-run with the full range.\n"
+        )
+
+    # ── Second pass: Vegard interpolation for failed intermediate x ───────────
+    for step in done_steps:
+        x = step.concentration
+        data = elastic_results.get(x, {})
+
+        if data and "C11" in data:
+            step.parsed.update(data)
+            continue
+
+        if 1e-5 < x < 1.0 - 1e-5 and have_endpoints:
+            interp = interpolate_elastic_vegard(x, elastic_at_0, elastic_at_1)
+            if interp:
+                step.parsed.update(interp)
+                b = interp.get("B_Hill_GPa", "—")
+                g = interp.get("G_Hill_GPa", "—")
+                e = interp.get("E_GPa", "—")
+                print(
+                    f"  ℹ  x={x:.4f}  Vegard:  "
+                    f"B={b}  G={g}  E={e} GPa"
+                )
+        elif data and "_elastic_error" in data:
+            step.parsed.update(data)
+
+    save_run(state)
+    csv_path = write_csv(state)
+    print(f"\n  Results (with Cij) → {csv_path}\n")
 
 
 def main() -> None:
@@ -430,24 +659,22 @@ def main() -> None:
 
         if single_mode:
             # No species or range needed for single compound.
-            # If --species Ti Ti was given, use that element; otherwise use
-            # the first element found in the cell.
             if same_species_flag and cli_species:
                 species_a = cli_species[0].capitalize()
             else:
                 species_a = species_in_cell[0] if species_in_cell else src.stem
             species_b = ""
             c_start, c_end, n_steps = 0.0, 0.0, 1
+            nonmetal_occupancy = 1.0  # no vacancy correction for single compound
         else:
-            species_a, species_b = ui.wizard_species(
-                cell_path, getattr(args, "species", None)
-            )
+            species_a, species_b = ui.wizard_species(cell_path, getattr(args, "species", None))
 
             # Interactive A == B → promote to single mode on the fly
             if species_a == species_b:
                 single_mode = True
                 species_b = ""
                 c_start, c_end, n_steps = 0.0, 0.0, 1
+                nonmetal_occupancy = 1.0
             else:
                 print(f"\n  System : {species_a}(1-x){species_b}(x)")
 
@@ -458,6 +685,62 @@ def main() -> None:
                     c_start = ui.ask_float("Start [0–1]: ")
                     c_end = ui.ask_float("End   [0–1]: ")
                     n_steps = ui.ask_int("Intervals (e.g. 8): ")
+
+                # ── VEC stability check ───────────────────────────────────────
+                # Detect nonmetal species from the .cell to compute VEC
+                from castep_io import (
+                    _NONMETALS as _NM,
+                    vec_for_system,
+                    vacancy_fraction_for_vec,
+                )
+                from castep_io import read_species as _read_sp
+                all_species = _read_sp(cell_path)
+                nonmetals_in_cell = [s for s in all_species
+                                     if s.capitalize() in _NM
+                                     and s.capitalize() not in {species_a, species_b}]
+                nonmetal = nonmetals_in_cell[0] if nonmetals_in_cell else None
+                nonmetal_occupancy = 1.0  # default: no vacancies
+
+                if nonmetal and n_steps > 1:
+                    # Check VEC at the most Nb/Mo-rich intermediate point
+                    x_max = c_end
+                    vec_at_max = vec_for_system(species_a, species_b, x_max, nonmetal)
+                    VEC_THRESHOLD = 8.3
+                    if vec_at_max > VEC_THRESHOLD:
+                        print(f"\n── VEC Stability Check ──")
+                        print(
+                            f"  ⚠  High Valence Electron Concentration detected.\n"
+                            f"     VEC at x={x_max:.2f}:  {vec_at_max:.2f}  "
+                            f"(threshold: {VEC_THRESHOLD})\n"
+                            f"     Cubic lattice may become elastically unstable\n"
+                            f"     (C44 → 0 or negative, Born stability violated).\n"
+                        )
+                        c_opt = vacancy_fraction_for_vec(
+                            species_a, species_b, x_max, nonmetal, target_vec=8.0
+                        )
+                        vac_pct = round((1.0 - c_opt) * 100, 1)
+                        print(
+                            f"  Enable dynamic {nonmetal} sub-lattice vacancies\n"
+                            f"  to stabilise VEC to 8.0?\n"
+                            f"  ({nonmetal} occupancy: {c_opt:.4f},  "
+                            f"vacancy: {vac_pct}%)  [y/N]: ",
+                            end="",
+                        )
+                        try:
+                            vec_ans = input().strip().lower()
+                        except EOFError:
+                            vec_ans = "n"
+                        if vec_ans in {"y", "yes"}:
+                            nonmetal_occupancy = c_opt
+                            print(
+                                f"  ✓  {nonmetal} vacancies enabled "
+                                f"({nonmetal_occupancy:.4f} occupancy per step)."
+                            )
+                        else:
+                            print(
+                                f"  ℹ  Proceeding without vacancy correction.\n"
+                                f"     Watch for 'Born stability violated' in elastic output."
+                            )
 
         # Timestamped project directory: TiZrC_Mar6_19-08
         timestamp = datetime.now().strftime("%b%-d_%H-%M")
@@ -473,6 +756,7 @@ def main() -> None:
             c_end=c_end,
             n_steps=n_steps,
             single_mode=single_mode,
+            nonmetal_occupancy=nonmetal_occupancy,
         )
     else:
         # ── Resumed run: re-validate binary ───────────────────────────────────
@@ -494,7 +778,9 @@ def main() -> None:
 
     log_path = state.proj_dir / "run.log"
     system_label = (
-        f"{state.species_a}(1-x){state.species_b}(x)" if not single_mode else state.seed
+        f"{state.species_a}(1-x){state.species_b}(x)"
+        if not single_mode
+        else state.seed
     )
     _log(log_path, f"Session start  {system_label}  proj={state.proj_dir.name}")
 
@@ -513,6 +799,10 @@ def main() -> None:
 
     _log(log_path, "Session complete.")
     print(f"\n  Results → {state.proj_dir / 'vca_results.csv'}\n")
+
+    # ── Optional: finite-strain elastic constants ─────────────────────────────
+    if getattr(args, "elastic", False) and state.n_done > 0:
+        _run_elastic_workflow(state, args)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,8 @@ VERSION = "5.1"
 # Engine configuration
 # ─────────────────────────────────────────────────────────────────────────────
 # Each DFT engine has its own EngineConfig instance.
-# ui.py and workflow.py import the active engine's config
+# ui.py and workflow.py import the active engine's config — they never
+# hard-code binary paths or command templates.
 #
 # To add a new engine (e.g. Quantum ESPRESSO):
 #   1. Create an EngineConfig instance below (QE_ENGINE).
@@ -62,7 +63,10 @@ class EngineConfig:
 # ── CASTEP (default) ──────────────────────────────────────────────────────────
 CASTEP_ENGINE = EngineConfig(
     name="CASTEP",
-    default_bin=("castep.mpi"),
+    default_bin=(
+        "~/Applications/CASTEP-25.12_2/bin/"
+        "linux_x86_64_gfortran10--mpi/castep.mpi"
+    ),
     cmd_template="mpirun -n {ncores} {bin} {seed}",
     input_suffix=".cell",
     output_suffix=".castep",
@@ -89,96 +93,21 @@ ACTIVE_ENGINE: EngineConfig = CASTEP_ENGINE
 _METALS: frozenset[str] = frozenset(
     {
         # s-block
-        "Li",
-        "Na",
-        "K",
-        "Rb",
-        "Cs",
-        "Be",
-        "Mg",
-        "Ca",
-        "Sr",
-        "Ba",
-        "Ra",
+        "Li", "Na", "K", "Rb", "Cs", "Be", "Mg", "Ca", "Sr", "Ba", "Ra",
         # d-block (transition metals)
-        "Sc",
-        "Ti",
-        "V",
-        "Cr",
-        "Mn",
-        "Fe",
-        "Co",
-        "Ni",
-        "Cu",
-        "Zn",
-        "Y",
-        "Zr",
-        "Nb",
-        "Mo",
-        "Tc",
-        "Ru",
-        "Rh",
-        "Pd",
-        "Ag",
-        "Cd",
-        "Hf",
-        "Ta",
-        "W",
-        "Re",
-        "Os",
-        "Ir",
-        "Pt",
-        "Au",
-        "Hg",
+        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+        "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+        "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
         # p-block metals
-        "Al",
-        "Ga",
-        "In",
-        "Sn",
-        "Tl",
-        "Pb",
-        "Bi",
+        "Al", "Ga", "In", "Sn", "Tl", "Pb", "Bi",
         # f-block
-        "La",
-        "Ce",
-        "Pr",
-        "Nd",
-        "Pm",
-        "Sm",
-        "Eu",
-        "Gd",
-        "Tb",
-        "Dy",
-        "Ho",
-        "Er",
-        "Tm",
-        "Yb",
-        "Lu",
-        "Th",
-        "U",
-        "Pu",
+        "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy",
+        "Ho", "Er", "Tm", "Yb", "Lu", "Th", "U", "Pu",
     }
 )
 
 _NONMETALS: frozenset[str] = frozenset(
-    {
-        "B",
-        "C",
-        "N",
-        "O",
-        "F",
-        "Si",
-        "P",
-        "S",
-        "Cl",
-        "As",
-        "Se",
-        "Br",
-        "Te",
-        "I",
-        "At",
-        "H",
-    }
+    {"B", "C", "N", "O", "F", "Si", "P", "S", "Cl", "As", "Se", "Br", "Te", "I", "At", "H"}
 )
 
 # Magnetic elements → spin_polarized : true
@@ -190,90 +119,100 @@ _HARD: frozenset[str] = frozenset({"C", "N", "O", "F", "B", "H"})
 # d-block elements → need nextra_bands : 20 for VCA
 _D_BLOCK: frozenset[str] = frozenset(
     {
-        "Sc",
-        "Ti",
-        "V",
-        "Cr",
-        "Mn",
-        "Fe",
-        "Co",
-        "Ni",
-        "Cu",
-        "Zn",
-        "Y",
-        "Zr",
-        "Nb",
-        "Mo",
-        "Tc",
-        "Ru",
-        "Rh",
-        "Pd",
-        "Ag",
-        "Cd",
-        "Hf",
-        "Ta",
-        "W",
-        "Re",
-        "Os",
-        "Ir",
-        "Pt",
-        "Au",
-        "Hg",
+        "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+        "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+        "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg",
     }
 )
 
+# Valence electron count per element (s+p+d, standard oxidation state in carbides/nitrides)
+# Sources: periodic table group number / CASTEP VEC convention for TMC/TMN
+VALENCE: dict[str, int] = {
+    # s-block
+    "Li": 1, "Na": 1, "K": 1,
+    "Be": 2, "Mg": 2, "Ca": 2, "Sr": 2, "Ba": 2,
+    # d-block (transition metals — group number = VEC contribution)
+    "Sc": 3, "Y": 3, "La": 3,
+    "Ti": 4, "Zr": 4, "Hf": 4,
+    "V":  5, "Nb": 5, "Ta": 5,
+    "Cr": 6, "Mo": 6, "W":  6,
+    "Mn": 7, "Re": 7,
+    "Fe": 8, "Ru": 8, "Os": 8,
+    "Co": 9, "Rh": 9, "Ir": 9,
+    "Ni": 10, "Pd": 10, "Pt": 10,
+    "Cu": 11, "Ag": 11, "Au": 11,
+    "Zn": 12, "Cd": 12,
+    # p-block nonmetals (as in transition metal carbides/nitrides context)
+    "B": 3, "Al": 3, "Ga": 3, "In": 3,
+    "C": 4, "Si": 4, "Ge": 4, "Sn": 4,
+    "N": 5, "P": 5, "As": 5,
+    "O": 6, "S": 6,
+}
+
+
+def vec_for_system(
+    species_a: str,
+    species_b: str,
+    x: float,
+    nonmetal: str,
+) -> float:
+    """
+    Compute the Valence Electron Concentration (VEC) for a VCA carbide/nitride.
+
+    VEC = (1-x)*val(A) + x*val(B) + val(nonmetal)
+    per formula unit (one metal + one nonmetal).
+
+    Used to predict elastic (in)stability:
+      VEC < 8.3  → elastically stable cubic (positive C44)
+      VEC > 8.4  → risk of C44 → 0 or negative (Born stability violated)
+      VEC ≈ 8.0  → optimal for hardness and stability (TiC = 8.0)
+
+    Reference: Music et al., Appl. Phys. Lett. 86 (2005); Zhang et al. (2010).
+    """
+    val_a = VALENCE.get(species_a.capitalize(), 0)
+    val_b = VALENCE.get(species_b.capitalize(), 0)
+    val_nm = VALENCE.get(nonmetal.capitalize(), 0)
+    return (1.0 - x) * val_a + x * val_b + val_nm
+
+
+def vacancy_fraction_for_vec(
+    species_a: str,
+    species_b: str,
+    x: float,
+    nonmetal: str,
+    target_vec: float = 8.0,
+) -> float:
+    """
+    Compute the nonmetal site occupancy needed to reach target_vec.
+
+    For Ti(1-x)Nb(x)C with VEC > target:
+      VEC(c) = [(1-x)*val(A) + x*val(B)] + c * val(nonmetal)
+      c = (target_vec - metal_vec) / val(nonmetal)
+
+    Returns a float in [0, 1]:
+      1.0 → full occupancy (no vacancies needed)
+      <1  → partial occupancy (vacancy concentration = 1 - c)
+      0.0 → degenerate case (clamped)
+    """
+    val_a   = VALENCE.get(species_a.capitalize(), 0)
+    val_b   = VALENCE.get(species_b.capitalize(), 0)
+    val_nm  = VALENCE.get(nonmetal.capitalize(), 1)   # avoid div-by-zero
+    metal_vec = (1.0 - x) * val_a + x * val_b
+    c = (target_vec - metal_vec) / val_nm
+    return max(0.0, min(1.0, c))
+
 # Covalent/metallic radii in Å for Vegard law scaling
 _RADIUS: dict[str, float] = {
-    "Li": 1.52,
-    "Na": 1.86,
-    "K": 2.27,
-    "Mg": 1.60,
-    "Ca": 1.97,
-    "Sr": 2.15,
-    "Ba": 2.22,
-    "Sc": 1.62,
-    "Y": 1.80,
-    "Ti": 1.47,
-    "Zr": 1.60,
-    "Hf": 1.59,
-    "V": 1.34,
-    "Nb": 1.46,
-    "Ta": 1.46,
-    "Cr": 1.28,
-    "Mo": 1.39,
-    "W": 1.39,
-    "Mn": 1.32,
-    "Re": 1.37,
-    "Fe": 1.26,
-    "Ru": 1.34,
-    "Os": 1.35,
-    "Co": 1.25,
-    "Rh": 1.34,
-    "Ir": 1.36,
-    "Ni": 1.24,
-    "Pd": 1.37,
-    "Pt": 1.39,
-    "Cu": 1.28,
-    "Ag": 1.44,
-    "Au": 1.44,
-    "Zn": 1.22,
-    "Cd": 1.49,
-    "Al": 1.43,
-    "Ga": 1.22,
-    "In": 1.63,
-    "Sn": 1.41,
-    "B": 0.87,
-    "C": 0.77,
-    "Si": 1.17,
-    "Ge": 1.22,
-    "N": 0.75,
-    "P": 1.10,
-    "As": 1.21,
-    "Sb": 1.41,
-    "La": 1.87,
-    "Ce": 1.82,
-    "Gd": 1.80,
-    "Lu": 1.74,
+    "Li": 1.52, "Na": 1.86, "K": 2.27, "Mg": 1.60, "Ca": 1.97, "Sr": 2.15, "Ba": 2.22,
+    "Sc": 1.62, "Y": 1.80, "Ti": 1.47, "Zr": 1.60, "Hf": 1.59,
+    "V": 1.34, "Nb": 1.46, "Ta": 1.46, "Cr": 1.28, "Mo": 1.39, "W": 1.39,
+    "Mn": 1.32, "Re": 1.37, "Fe": 1.26, "Ru": 1.34, "Os": 1.35,
+    "Co": 1.25, "Rh": 1.34, "Ir": 1.36, "Ni": 1.24, "Pd": 1.37, "Pt": 1.39,
+    "Cu": 1.28, "Ag": 1.44, "Au": 1.44, "Zn": 1.22, "Cd": 1.49,
+    "Al": 1.43, "Ga": 1.22, "In": 1.63, "Sn": 1.41,
+    "B": 0.87, "C": 0.77, "Si": 1.17, "Ge": 1.22,
+    "N": 0.75, "P": 1.10, "As": 1.21, "Sb": 1.41,
+    "La": 1.87, "Ce": 1.82, "Gd": 1.80, "Lu": 1.74,
 }
 
 
@@ -426,9 +365,7 @@ def is_conventional_cell(cell_path: Path) -> bool:
         for i, coord_a in enumerate(coords):
             for coord_b in coords[i + 1 :]:
                 diffs = [abs(coord_a[k] - coord_b[k]) for k in range(3)]
-                half_count = sum(
-                    1 for d in diffs if abs(d - 0.5) < 0.01 or abs(d) < 0.01
-                )
+                half_count = sum(1 for d in diffs if abs(d - 0.5) < 0.01 or abs(d) < 0.01)
                 if half_count == 3:
                     return True
     return False
@@ -558,6 +495,7 @@ def write_vca_cell(
     x: float,
     *,
     vegard: bool = True,
+    nonmetal_occupancy: float = 1.0,
 ) -> None:
     """
     Write a CASTEP .cell file with VCA MIXTURE syntax for concentration x.
@@ -573,6 +511,19 @@ def write_vca_cell(
     At x ≈ 0 or x ≈ 1 the MIXTURE tag is omitted and the pure element is
     written directly (avoids symmetry issues).
     Lattice is pre-scaled by Vegard law unless vegard=False.
+
+    nonmetal_occupancy (VEC stabilizer)
+    ────────────────────────────────────
+    When nonmetal_occupancy < 1.0, all non-metal (C, N …) sites are written
+    with a MIXTURE tag that creates a partial vacancy:
+
+        C   0.5 0.5 0.5   MIXTURE:( 1 {nonmetal_occupancy:.8f})
+
+    CASTEP interprets the missing fraction as a structural vacancy — the
+    site is occupied with probability nonmetal_occupancy and empty otherwise.
+    This reduces the effective VEC towards the target (default 8.0) and
+    stabilises the C44 elastic constant for Nb/Mo-rich compositions.
+    Use vacancy_fraction_for_vec() from castep_io to compute this value.
     """
     fraction_a = round(1.0 - x, 10)
     fraction_b = round(x, 10)
@@ -630,6 +581,31 @@ def write_vca_cell(
                     new_rows.append(f"{label}   {coord}")
 
     new_rows.append("%ENDBLOCK POSITIONS_FRAC")
+
+    # ── Apply nonmetal vacancy (VEC stabilizer) ───────────────────────────────
+    # If nonmetal_occupancy < 1.0, rewrite all non-metal site lines to include
+    # a MIXTURE tag. Nonmetals are identified as elements NOT equal to species_a
+    # or species_b that also appear in _NONMETALS. Only applied for intermediate
+    # x (not pure endpoints) since pure phases don't need VEC correction.
+    if nonmetal_occupancy < 1.0 - 1e-6 and 1e-6 < x < 1.0 - 1e-6:
+        occ = round(nonmetal_occupancy, 8)
+        patched_rows: list[str] = []
+        for row in new_rows:
+            stripped = row.strip()
+            if stripped.startswith("%"):
+                patched_rows.append(row)
+                continue
+            parts = stripped.split()
+            if parts and parts[0].capitalize() in _NONMETALS:
+                # Rebuild with vacancy MIXTURE
+                label_nm = parts[0]
+                coords_nm = "   ".join(parts[1:4]) if len(parts) >= 4 else " ".join(parts[1:])
+                patched_rows.append(
+                    f"{label_nm}   {coords_nm}  MIXTURE:( 1 {occ:.8f})"
+                )
+            else:
+                patched_rows.append(row)
+        new_rows = patched_rows
     new_block = "\n".join(new_rows)
     new_text = _RE_POSITIONS_BLOCK.sub(new_block, src_text)
 
@@ -637,7 +613,8 @@ def write_vca_cell(
         new_text = vegard_scale(new_text, species_a, species_b, x)
 
     header = (
-        f"# VCA  {species_a}(1-x){species_b}(x)  x={x:.6f}  — vca_tool v{VERSION}\n"
+        f"# VCA  {species_a}(1-x){species_b}(x)  x={x:.6f}"
+        f"  — vca_tool v{VERSION}\n"
     )
     dest.write_text(header + new_text, encoding="utf-8")
 
@@ -656,10 +633,10 @@ def nextra_for_element(elem: str) -> int:
     """
     element = elem.capitalize()
     if element in _D_BLOCK:
-        return 10  # pure d-metal: moderate Fermi surface
+        return 10   # pure d-metal: moderate Fermi surface
     if element in _HARD:
-        return 4  # pure nonmetal: typically gapped
-    return 6  # s/p metal
+        return 4    # pure nonmetal: typically gapped
+    return 6        # s/p metal
 
 
 def nextra_for_step(species_a: str, species_b: str, x: float) -> int:
@@ -681,7 +658,7 @@ def nextra_for_step(species_a: str, species_b: str, x: float) -> int:
     n_b = nextra_for_element(species_b)
     base = round(n_a * (1.0 - x) + n_b * x)
     if 0.01 < x < 0.99:
-        return base + 10  # VCA fractional charge overhead
+        return base + 10   # VCA fractional charge overhead
     return base
 
 
@@ -709,7 +686,9 @@ def _choose_spin(species_list: list[str]) -> bool:
     return any(s.capitalize() in _MAGNETIC for s in species_list)
 
 
-def param_smart_defaults(species_list: list[str], is_vca: bool) -> dict[str, Any]:
+def param_smart_defaults(
+    species_list: list[str], is_vca: bool
+) -> dict[str, Any]:
     """
     Return a dict of recommended .param values for the given species set.
     Called by ui.py to show the user what the program recommends.
@@ -733,27 +712,54 @@ def write_param(
     cut_off_energy: int,
     spin_polarized: bool,
     nextra_bands: int,
+    *,
+    ncp: bool = False,
 ) -> None:
-    """Write a CASTEP 25 .param file with VCA-optimised settings."""
-    is_geom = task == "GeometryOptimization"
+    """
+    Write a CASTEP 25 .param file with VCA-optimised settings.
+
+    ncp=True is required for ElasticConstants and Phonons (DFPT) tasks —
+    those tasks cannot use the default ultrasoft pseudopotentials.
+    When ncp=True the caller must also call inject_species_pot_ncp() on
+    the corresponding .cell file, and use a higher cut_off_energy
+    (≥900 eV for systems with C/N/O, ≥700 eV for pure metals).
+    """
+    # FiniteStrainElastic is a vca_tool marker task, not a native CASTEP task.
+    # It is stored in the .param file so main.py knows to run the 2-phase
+    # workflow. The actual CASTEP runs use GeometryOptimization (phase 1)
+    # and SinglePoint (phase 2) with tighter tolerances for accurate Cij.
+    is_geom = task in {"GeometryOptimization", "FiniteStrainElastic"}
     is_elastic = task == "ElasticConstants"
 
     if is_geom:
+        # FiniteStrainElastic needs tighter tolerances than normal GeomOpt
+        # so we apply the elastic-grade tolerances for both.
         geom_block = (
             "calculate_stress    : true\n"
             "geom_method         : LBFGS\n"
             "geom_max_iter       : 150\n"
-            "geom_energy_tol     : 1.0e-5 eV\n"
-            "geom_force_tol      : 0.01 eV/ang\n"
-            "geom_stress_tol     : 0.05 GPa\n"
-            "geom_disp_tol       : 0.001 ang\n"
+            "geom_energy_tol     : 1.0e-6 eV\n"
+            "geom_force_tol      : 0.005 eV/ang\n"
+            "geom_stress_tol     : 0.03 GPa\n"
+            "geom_disp_tol       : 0.0005 ang\n"
         )
     elif is_elastic:
-        geom_block = "calculate_stress    : true\n"
+        # ElasticConstants needs tighter SCF convergence for accurate shear moduli.
+        # CASTEP internally runs geometry optimisation for each strained structure
+        # (ions only, fixed cell) — these tolerances apply to those sub-runs.
+        geom_block = (
+            "calculate_stress    : true\n"
+            "geom_method         : LBFGS\n"
+            "geom_max_iter       : 100\n"
+            "geom_energy_tol     : 1.0e-6 eV\n"
+            "geom_force_tol      : 0.005 eV/ang\n"
+            "geom_disp_tol       : 0.0005 ang\n"
+        )
     else:
         geom_block = "calculate_stress    : false\n"
 
     spin_str = "true" if spin_polarized else "false"
+    ncp_note = "  # NCP required for this task — raise cutoff to ≥900 eV for C/N/O" if ncp else ""
     content = (
         f"# CASTEP 25 parameter file — generated by vca_tool v{VERSION}\n"
         f"# ========================================================\n"
@@ -761,7 +767,7 @@ def write_param(
         f"# ========================================================\n"
         f"task                : {task}\n"
         f"xc_functional       : {xc_functional}\n"
-        f"cut_off_energy      : {cut_off_energy} eV\n"
+        f"cut_off_energy      : {cut_off_energy} eV{ncp_note}\n"
         f"spin_polarized      : {spin_str}\n"
         f"\n"
         f"# ========================================================\n"
@@ -834,39 +840,70 @@ class CastepResult:
     bulk_modulus_GPa: float | None = None
     wall_time_s: float | None = None
     geom_converged: bool = False
-    task_type: str = ""  # "GeometryOptimization" or "SinglePoint" etc.
+    task_type: str = ""        # "GeometryOptimization" or "SinglePoint" etc.
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Export all non-None fields as a flat dict for CSV/JSON serialisation."""
         result: dict[str, Any] = {}
-        result["enthalpy_eV"] = (
-            f"{self.enthalpy_eV:.6f}" if self.enthalpy_eV is not None else ""
-        )
-        result["a_opt_ang"] = (
-            f"{self.a_opt_ang:.5f}" if self.a_opt_ang is not None else ""
-        )
-        result["b_opt_ang"] = (
-            f"{self.b_opt_ang:.5f}" if self.b_opt_ang is not None else ""
-        )
-        result["c_opt_ang"] = (
-            f"{self.c_opt_ang:.5f}" if self.c_opt_ang is not None else ""
-        )
-        result["volume_ang3"] = (
-            f"{self.volume_ang3:.4f}" if self.volume_ang3 is not None else ""
-        )
-        result["density_gcm3"] = (
-            f"{self.density_gcm3:.4f}" if self.density_gcm3 is not None else ""
-        )
+        result["enthalpy_eV"] = f"{self.enthalpy_eV:.6f}" if self.enthalpy_eV is not None else ""
+        result["a_opt_ang"] = f"{self.a_opt_ang:.5f}" if self.a_opt_ang is not None else ""
+        result["b_opt_ang"] = f"{self.b_opt_ang:.5f}" if self.b_opt_ang is not None else ""
+        result["c_opt_ang"] = f"{self.c_opt_ang:.5f}" if self.c_opt_ang is not None else ""
+        result["volume_ang3"] = f"{self.volume_ang3:.4f}" if self.volume_ang3 is not None else ""
+        result["density_gcm3"] = f"{self.density_gcm3:.4f}" if self.density_gcm3 is not None else ""
         result["bulk_modulus_GPa"] = (
             f"{self.bulk_modulus_GPa:.2f}" if self.bulk_modulus_GPa is not None else ""
         )
-        result["wall_time_s"] = (
-            f"{self.wall_time_s:.1f}" if self.wall_time_s is not None else ""
-        )
+        result["wall_time_s"] = f"{self.wall_time_s:.1f}" if self.wall_time_s is not None else ""
         result["geom_converged"] = "yes" if self.geom_converged else "no"
         result["warnings"] = "; ".join(self.warnings[:3])
         return result
+
+
+def inject_species_pot_ncp(cell_path: Path) -> None:
+    """
+    Ensure every species in the .cell file uses norm-conserving pseudopotentials.
+
+    ElasticConstants and Phonon tasks cannot use ultrasoft pseudopotentials —
+    including for VCA MIXTURE atoms. The only reliable way to force NCP for
+    all species (including on-the-fly VCA virtual atoms) is to list each
+    element explicitly in SPECIES_POT with the "NCP" keyword:
+
+        %BLOCK SPECIES_POT
+        Ti  NCP
+        V   NCP
+        C   NCP
+        %ENDBLOCK SPECIES_POT
+
+    A bare "NCP" without element names is ignored for MIXTURE/OTFG atoms.
+
+    This function:
+      1. Reads the species present in POSITIONS_FRAC.
+      2. Removes any existing SPECIES_POT block.
+      3. Writes a fresh block with every species explicitly set to NCP.
+
+    Safe to call multiple times — re-generates the block each time to
+    ensure completeness if species change between calls.
+    NCP requires a higher cutoff than USP: ≥900 eV for C/N/O, ≥700 for metals.
+    """
+    content = cell_path.read_text(encoding="utf-8", errors="replace")
+    species = read_species(cell_path)
+    if not species:
+        # Fallback: generic NCP block if we cannot read species
+        species_lines = "NCP"
+    else:
+        species_lines = "\n".join(f"{s}  NCP" for s in species)
+
+    # Remove any existing SPECIES_POT block before re-writing
+    content = re.sub(
+        r"%BLOCK\s+SPECIES_POT.*?%ENDBLOCK\s+SPECIES_POT\s*",
+        "",
+        content,
+        flags=re.DOTALL | re.I,
+    )
+    ncp_block = f"\n%BLOCK SPECIES_POT\n{species_lines}\n%ENDBLOCK SPECIES_POT\n"
+    cell_path.write_text(content.rstrip() + ncp_block, encoding="utf-8")
 
 
 def _try_float(value: str) -> float | None:
@@ -924,28 +961,17 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
                 result.task_type = colon_parts[-1].strip()
 
         # ── Geometry convergence ─────────────────────────────────────────────
-        if (
-            not result.geom_converged
-            and "Geometry optimization completed successfully" in line
-        ):
+        if not result.geom_converged and "Geometry optimization completed successfully" in line:
             result.geom_converged = True
 
         # ── Enthalpy: "LBFGS: Final Enthalpy     = -1.90301018E+003 eV" ──────
-        if (
-            result.enthalpy_eV is None
-            and "Final Enthalpy" in line
-            and "Pseudo" not in line
-        ):
+        if result.enthalpy_eV is None and "Final Enthalpy" in line and "Pseudo" not in line:
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 result.enthalpy_eV = _try_float(eq_parts[-1].strip().split()[0])
 
         # ── Energy fallback: "Final energy, E             =  -1902.769 eV" ───
-        if (
-            result.enthalpy_eV is None
-            and "Final energy, E" in line
-            and "Pseudo" not in line
-        ):
+        if result.enthalpy_eV is None and "Final energy, E" in line and "Pseudo" not in line:
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 result.enthalpy_eV = _try_float(eq_parts[-1].strip().split()[0])
@@ -973,12 +999,7 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
 
         # ── Density: "                    =            12.449217     g/cm^3" ──
         # Must exclude "AMU/A**3" line that appears just above it
-        if (
-            result.density_gcm3 is None
-            and "g/cm" in line
-            and "=" in line
-            and "AMU" not in line
-        ):
+        if result.density_gcm3 is None and "g/cm" in line and "=" in line and "AMU" not in line:
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 value = _try_float(eq_parts[-1].strip().split()[0])
@@ -986,11 +1007,7 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
                     result.density_gcm3 = value
 
         # ── Bulk modulus: "LBFGS: Final bulk modulus = …" ────────────────────
-        if (
-            result.bulk_modulus_GPa is None
-            and "Final bulk modulus" in line
-            and "=" in line
-        ):
+        if result.bulk_modulus_GPa is None and "Final bulk modulus" in line and "=" in line:
             eq_parts = line.split("=")
             if len(eq_parts) >= 2:
                 result.bulk_modulus_GPa = _try_float(eq_parts[-1].strip().split()[0])
@@ -1012,5 +1029,103 @@ def parse_castep_log(castep_path: Path) -> CastepResult:
                 msg = colon_parts[1].strip()
                 if msg and msg not in result.warnings:
                     result.warnings.append(msg)
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .elastic file parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def parse_elastic_file(elastic_path: Path) -> dict[str, Any]:
+    """
+    Parse a CASTEP .elastic output file and extract the full elastic tensor
+    and derived mechanical properties.
+
+    CASTEP writes the .elastic file when task : ElasticConstants completes.
+    It contains the 6×6 Cij tensor, Sij compliances, and derived properties
+    (bulk modulus, shear modulus, Young's modulus, Poisson ratio, Debye temp,
+    Vickers hardness) using Voigt, Reuss, and Hill averaging schemes.
+
+    Returns a flat dict[str, Any] suitable for direct insertion into Step.parsed
+    so all columns appear automatically in vca_results.csv.
+
+    Real .elastic file format (CASTEP 25):
+        ===================================== Elastic Stiffness Constants Cij (GPa) ================
+        775.33017  163.75610  163.75610  0.00000  0.00000  0.00000
+        ...
+        Voigt bulk modulus    =   367.613
+        Reuss bulk modulus    =   367.613
+        Hill bulk modulus     =   367.613
+        Voigt shear modulus   =   ...
+        Young modulus ...
+        Poisson ratio ...
+        Debye temperature     =   ...
+        Vickers hardness      =   ...
+    """
+    result: dict[str, Any] = {}
+
+    if not elastic_path.exists():
+        return result
+
+    try:
+        lines = elastic_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return result
+
+    in_cij = False
+    cij_rows: list[list[float]] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # ── Cij 6×6 matrix ───────────────────────────────────────────────────
+        if "Elastic Stiffness Constants Cij" in line:
+            in_cij = True
+            cij_rows = []
+            continue
+        if in_cij:
+            if stripped.startswith("=") or not stripped:
+                if len(cij_rows) == 6:
+                    in_cij = False
+                continue
+            parts = stripped.split()
+            if len(parts) == 6:
+                try:
+                    cij_rows.append([float(v) for v in parts])
+                except ValueError:
+                    pass
+            if len(cij_rows) == 6:
+                in_cij = False
+                # Store individual Cij components (uppercase C11, C12, …)
+                labels = [
+                    ("C11", 0, 0), ("C12", 0, 1), ("C13", 0, 2),
+                    ("C22", 1, 1), ("C23", 1, 2), ("C33", 2, 2),
+                    ("C44", 3, 3), ("C55", 4, 4), ("C66", 5, 5),
+                ]
+                for key, i, j in labels:
+                    result[key] = f"{cij_rows[i][j]:.4f}"
+
+        # ── Derived properties — "Label = value" format ──────────────────────
+        _PROPS = {
+            "Voigt bulk modulus": "B_Voigt_GPa",
+            "Reuss bulk modulus": "B_Reuss_GPa",
+            "Hill bulk modulus": "B_Hill_GPa",
+            "Voigt shear modulus": "G_Voigt_GPa",
+            "Reuss shear modulus": "G_Reuss_GPa",
+            "Hill shear modulus": "G_Hill_GPa",
+            "Young modulus": "E_GPa",
+            "Poisson ratio": "nu",
+            "Debye temperature": "T_Debye_K",
+            "Vickers hardness": "H_Vickers_GPa",
+        }
+        for label, col_name in _PROPS.items():
+            if label in line and "=" in line:
+                eq_parts = line.split("=")
+                if len(eq_parts) >= 2:
+                    value = _try_float(eq_parts[-1].strip().split()[0])
+                    if value is not None:
+                        result[col_name] = f"{value:.4f}"
 
     return result

@@ -103,26 +103,24 @@ def ask_choice(options: list[str], default: str) -> str:
 # .param wizard
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Tasks always available (compatible with VCA MIXTURE + ultrasoft pseudopotentials)
 _TASKS = [
     "GeometryOptimization",
     "SinglePoint",
-    "ElasticConstants",
     "MolecularDynamics",
-    "Phonon",
     "BandStructure",
     "Optics",
 ]
 
+# Tasks requiring NCP + no MIXTURE — available only in single-compound mode.
+# CASTEP explicitly blocks strain-field response for MIXTURE atoms.
+# For VCA elastic constants use the finite-strain workflow:
+#   GeometryOptimization → elastic_workflow.run_finite_strain_elastic()
+_NCP_ONLY_TASKS = ["ElasticConstants", "Phonon"]
+
 _XC_FUNCTIONALS = [
-    "PBE",
-    "PBEsol",
-    "WC",
-    "PW91",
-    "RPBE",
-    "LDA",
-    "RSCAN",
-    "PBE0",
-    "HSE06",
+    "PBE", "PBEsol", "WC", "PW91", "RPBE",
+    "LDA", "RSCAN", "PBE0", "HSE06",
 ]
 
 
@@ -142,12 +140,43 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     print("  No .param found — configuring physics settings.")
     print("  Press Enter to accept the [default] shown in brackets.\n")
 
-    # 1/4 Task
+    # 1/4 Task — NCP tasks (ElasticConstants, Phonon) only shown for single-compound mode
+    available_tasks = _TASKS if is_vca else (_TASKS + _NCP_ONLY_TASKS)
     print("  ┌ 1/4  Task")
-    for task_name in _TASKS:
+    for task_name in available_tasks:
         marker = "  (default)" if task_name == "GeometryOptimization" else ""
         print(f"  │  {task_name}{marker}")
-    task = ask_choice(_TASKS, "GeometryOptimization")
+    if is_vca:
+        print(
+            "  │  ℹ  ElasticConstants / Phonon are disabled for VCA sweeps.\n"
+            "  │     After GeometryOptimization completes, use --elastic flag\n"
+            "  │     to run the finite-strain Cij workflow automatically."
+        )
+    task = ask_choice(available_tasks, "GeometryOptimization")
+
+    # NCP: only ElasticConstants/Phonon in single-compound mode need norm-conserving PSP
+    _NCP_TASKS = {"ElasticConstants", "Phonon"}
+    needs_ncp = task in _NCP_TASKS
+    if needs_ncp:
+        print(
+            f"\n  ⚠  {task} requires norm-conserving pseudopotentials (NCP).\n"
+            "     Ultrasoft (default) will crash: "
+            "'strain field response with ultrasoft PSP not implemented'.\n"
+            "\n"
+            "     The tool will automatically inject SPECIES_POT NCP into your .cell.\n"
+            "     Cutoff is raised to ≥900 eV for hard elements (C, N, O).\n"
+            "\n"
+            "     ── Recommended workflow ──────────────────────────────────\n"
+            "     Step 1: GeometryOptimization (USP, fast)\n"
+            "             → produces TiC-out.cell with relaxed geometry\n"
+            "     Step 2: ElasticConstants on the relaxed cell (NCP, slower)\n"
+            "             python main.py TiC-out.cell --single\n"
+            "             → results written to TiC-out.elastic\n"
+            "\n"
+            "     The .elastic file contains: Cij tensor, bulk/shear/Young modulus,\n"
+            "     Poisson ratio, Debye temperature, Vickers hardness.\n"
+            "     Parse it with: castep_io.parse_elastic_file(path)\n"
+        )
     print()
 
     # 2/4 XC Functional
@@ -160,19 +189,24 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     xc = ask_choice(_XC_FUNCTIONALS, "PBE")
     print()
 
-    # 3/4 Cut-off energy
+    # 3/4 Cut-off energy — NCP needs higher cutoff than USP
     recommended_cutoff = defaults["cut_off_energy"]
     hard_detected = defaults["hard_detected"]
+    if needs_ncp and hard_detected:
+        recommended_cutoff = max(recommended_cutoff, 900)
+    elif needs_ncp:
+        recommended_cutoff = max(recommended_cutoff, 700)
     print("  ┌ 3/4  Cut-off Energy (eV)")
+    if needs_ncp:
+        print("  │  ℹ  NCP requires higher cutoff than USP:")
+        print("  │     ≥900 eV for hard elements (C, N, O), ≥700 eV for pure metals.")
     if hard_detected:
         print(f"  │  ⚠  Hard elements detected: {hard_detected}")
-        print("  │  Minimum 700 eV is mandatory for C, N, O, F, B.")
+        print("  │  Minimum 700 eV (USP) / 900 eV (NCP) for C, N, O, F, B.")
     else:
-        print("  │  500 eV — production quality for metals/alloys")
+        print("  │  500 eV — production quality for metals/alloys (USP)")
         print("  │  700 eV — mandatory for hard elements (C, N, O, F)")
-    raw_cutoff = ask_str(
-        f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff)
-    )
+    raw_cutoff = ask_str(f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff))
     try:
         cut_off_energy = max(int(float(raw_cutoff.split()[0])), 100)
     except ValueError:
@@ -198,11 +232,13 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     # nextra_bands — automatic, not asked
     nextra_bands = defaults["nextra_bands"]
     print(f"  ℹ  nextra_bands : {nextra_bands}  (auto-selected for this system)")
+    if needs_ncp:
+        print("  ℹ  Injecting SPECIES_POT NCP block into .cell file …")
+        castep_io.inject_species_pot_ncp(cell_path)
+        print("  ✓  .cell updated with NCP pseudopotentials")
     print()
 
-    castep_io.write_param(
-        param_path, task, xc, cut_off_energy, spin_polarized, nextra_bands
-    )
+    castep_io.write_param(param_path, task, xc, cut_off_energy, spin_polarized, nextra_bands, ncp=needs_ncp)
     print(f"  ✓ Written: {param_path.name}")
     return param_path
 
@@ -229,7 +265,9 @@ def _warn_cell_size(cell_path: Path) -> None:
         )
 
 
-def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str, str]:
+def wizard_species(
+    cell_path: Path, cli_species: list[str] | None
+) -> tuple[str, str]:
     """
     Determine (species_a, species_b) pair for a VCA sweep.
 
@@ -264,9 +302,7 @@ def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str,
     print("  x=0 → pure A (the element you substitute FROM)")
     print("  x=1 → pure B (the element you substitute TO)")
     print("  All other sublattices (e.g. C in TiC) stay unchanged.")
-    print(
-        "  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc."
-    )
+    print("  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc.")
 
     while True:
         default_a = found_species[0] if found_species else ""
@@ -277,9 +313,7 @@ def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str,
             print("  ⚠  Required.")
             continue
         if species_a not in found_species:
-            print(
-                f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})"
-            )
+            print(f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})")
             continue
 
         raw_b = ask_str(f"  Replace {species_a} with (or same for single-compound): ")
@@ -291,9 +325,7 @@ def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str,
 
         # A == B → signal single_mode by returning identical pair; main.py detects this
         if species_a == species_b:
-            print(
-                f"  ℹ  A == B ({species_a}) → will run as single-compound calculation."
-            )
+            print(f"  ℹ  A == B ({species_a}) → will run as single-compound calculation.")
             _warn_cell_size(cell_path)
             return species_a, species_b
 
@@ -416,8 +448,7 @@ def print_step_result(
     # FAILED
     print(f"  └─ ✗ FAILED (rc={step.rc})")
     useful_stderr = [
-        line
-        for line in exec_result.stderr_tail
+        line for line in exec_result.stderr_tail
         if line.strip() and "PMIX" not in line and not line.startswith("[")
     ][-5:]
     for line in useful_stderr:
@@ -427,12 +458,8 @@ def print_step_result(
     if castep_log.exists():
         all_lines = castep_log.read_text(errors="replace").splitlines()
         error_lines = [
-            ln
-            for ln in all_lines[-40:]
-            if any(
-                kw in ln.lower()
-                for kw in ("error", "abort", "fatal", "failed", "warning")
-            )
+            ln for ln in all_lines[-40:]
+            if any(kw in ln.lower() for kw in ("error", "abort", "fatal", "failed", "warning"))
         ]
         for line in error_lines[-4:]:
             print(f"     │ {line.strip()}")
@@ -469,9 +496,7 @@ def print_summary(state: RunState) -> None:
         f"  {'#':>3}  {'x':>7}  {'Status':<8}  {'H (eV)':>16}"
         f"  {'a (Å)':>8}  {'B (GPa)':>7}  conv"
     )
-    print(
-        f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}"
-    )
+    print(f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}")
 
     for step in steps:
         flag = " ⚠" if step.geom_converged == "no" and step.status == DONE else ""
@@ -486,10 +511,8 @@ def print_summary(state: RunState) -> None:
             f"  {(step.geom_converged or '—')}{flag}"
         )
 
-    counts = {
-        st: sum(1 for s in steps if s.status == st)
-        for st in (DONE, SKIPPED, FAILED, PENDING)
-    }
+    counts = {st: sum(1 for s in steps if s.status == st)
+              for st in (DONE, SKIPPED, FAILED, PENDING)}
     print(f"{'═' * W}")
     print(
         f"  ✓ {counts[DONE]}  ⊘ {counts[SKIPPED]}"
@@ -498,11 +521,20 @@ def print_summary(state: RunState) -> None:
 
     dh_data = mixing_enthalpy(steps)
     if dh_data:
-        print("\n  ── ΔH_mix ──────────────────────────────────────")
-        print(f"  {'x':>7}   {'H (eV)':>16}   {'ΔH (meV/f.u.)':>14}")
-        print(f"  {'─' * 7}   {'─' * 16}   {'─' * 14}")
+        print("\n  ── H(x) deviation from Vegard linear mixing ─────────────────────")
+        print(
+            "  ⚠  VCA ΔH values are dominated by pseudopotential offsets between"
+        )
+        print(
+            "     species (~eV range), NOT chemical mixing energy (~meV range)."
+        )
+        print(
+            "     Use lattice parameter and Cij vs x for quantitative analysis."
+        )
+        print(f"\n  {'x':>7}   {'H_total (eV)':>16}   {'ΔH_Vegard (meV/cell)':>22}")
+        print(f"  {'─' * 7}   {'─' * 16}   {'─' * 22}")
         for x_val, h_val, dh_val in dh_data:
-            print(f"  {x_val:>7.4f}   {h_val:>16.6f}   {dh_val:>+14.2f}")
+            print(f"  {x_val:>7.4f}   {h_val:>16.6f}   {dh_val:>+22.2f}")
         print()
     elif counts[DONE] > 0 and counts[FAILED] == 0:
-        print("  ⚠  ΔH_mix skipped — x=0 or x=1 endpoint missing/not converged.")
+        print("  ⚠  ΔH skipped — x=0 or x=1 endpoint missing/not converged.")
