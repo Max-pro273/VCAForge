@@ -779,7 +779,7 @@ def write_param(
         f"smearing_width      : 0.10 eV\n"
         f"mix_charge_amp      : 0.2\n"
         f"nextra_bands        : {nextra_bands}\n"
-        f"elec_energy_tol     : 1.0e-6 eV\n"
+        f"elec_energy_tol     : 1.0e-5 eV  # GeomOpt tolerance; elastic uses 1e-7\n"
         f"\n"
         f"# ========================================================\n"
         f"# GEOMETRY / TASK SETTINGS\n"

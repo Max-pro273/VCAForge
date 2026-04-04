@@ -5,6 +5,8 @@ Responsibilities:
   • All user prompts (ask_yes_no, ask_float, ask_int, ask_choice, ask_str)
   • Setup wizards (param, species, concentration range, CASTEP command)
   • Step display (header, progress, result line, summary table)
+  • VEC Stability Predictor (pre-run analysis + interactive guard)
+  • Elastic step display (unified inline format inside step box)
   • ΔH_mix table rendering
 
 No subprocess calls, no file I/O (except reading species for display),
@@ -16,6 +18,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import sys
+import time
 from pathlib import Path
 
 import castep_io
@@ -33,7 +36,19 @@ from workflow import (
     mixing_enthalpy,
 )
 
-VERSION = "5.1"
+VERSION = "5.2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format a duration as '45s' or '1m 12s'."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m {s % 60}s"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,8 +134,15 @@ _TASKS = [
 _NCP_ONLY_TASKS = ["ElasticConstants", "Phonon"]
 
 _XC_FUNCTIONALS = [
-    "PBE", "PBEsol", "WC", "PW91", "RPBE",
-    "LDA", "RSCAN", "PBE0", "HSE06",
+    "PBE",
+    "PBEsol",
+    "WC",
+    "PW91",
+    "RPBE",
+    "LDA",
+    "RSCAN",
+    "PBE0",
+    "HSE06",
 ]
 
 
@@ -206,7 +228,9 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     else:
         print("  │  500 eV — production quality for metals/alloys (USP)")
         print("  │  700 eV — mandatory for hard elements (C, N, O, F)")
-    raw_cutoff = ask_str(f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff))
+    raw_cutoff = ask_str(
+        f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff)
+    )
     try:
         cut_off_energy = max(int(float(raw_cutoff.split()[0])), 100)
     except ValueError:
@@ -238,7 +262,15 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
         print("  ✓  .cell updated with NCP pseudopotentials")
     print()
 
-    castep_io.write_param(param_path, task, xc, cut_off_energy, spin_polarized, nextra_bands, ncp=needs_ncp)
+    castep_io.write_param(
+        param_path,
+        task,
+        xc,
+        cut_off_energy,
+        spin_polarized,
+        nextra_bands,
+        ncp=needs_ncp,
+    )
     print(f"  ✓ Written: {param_path.name}")
     return param_path
 
@@ -265,9 +297,7 @@ def _warn_cell_size(cell_path: Path) -> None:
         )
 
 
-def wizard_species(
-    cell_path: Path, cli_species: list[str] | None
-) -> tuple[str, str]:
+def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str, str]:
     """
     Determine (species_a, species_b) pair for a VCA sweep.
 
@@ -302,7 +332,9 @@ def wizard_species(
     print("  x=0 → pure A (the element you substitute FROM)")
     print("  x=1 → pure B (the element you substitute TO)")
     print("  All other sublattices (e.g. C in TiC) stay unchanged.")
-    print("  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc.")
+    print(
+        "  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc."
+    )
 
     while True:
         default_a = found_species[0] if found_species else ""
@@ -313,7 +345,9 @@ def wizard_species(
             print("  ⚠  Required.")
             continue
         if species_a not in found_species:
-            print(f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})")
+            print(
+                f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})"
+            )
             continue
 
         raw_b = ask_str(f"  Replace {species_a} with (or same for single-compound): ")
@@ -325,7 +359,9 @@ def wizard_species(
 
         # A == B → signal single_mode by returning identical pair; main.py detects this
         if species_a == species_b:
-            print(f"  ℹ  A == B ({species_a}) → will run as single-compound calculation.")
+            print(
+                f"  ℹ  A == B ({species_a}) → will run as single-compound calculation."
+            )
             _warn_cell_size(cell_path)
             return species_a, species_b
 
@@ -402,18 +438,42 @@ def wizard_castep_cmd(override: str | None) -> str:
 
 def print_step_header(step: Step, total: int, state: RunState) -> None:
     x = step.concentration
-    cmd_display = (
+    cmd = (
         state.castep_cmd.replace("{seed}", state.seed)
         if state.castep_cmd
         else "prepare only"
     )
+    # Inline VEC annotation
+    vec_tag = ""
+    try:
+        from castep_io import _NONMETALS as _NM
+        from elasticity import vec_for_concentration, vec_stability_band
+
+        all_sp = castep_io.read_species(state.proj_dir.parent / f"{state.seed}.cell")
+        nonmetal = next(
+            (
+                s
+                for s in all_sp
+                if s.capitalize() in _NM
+                and s.capitalize() not in {state.species_a, state.species_b}
+            ),
+            None,
+        )
+        vec = vec_for_concentration(state.species_a, state.species_b, x, nonmetal)
+        band = vec_stability_band(vec)
+        icon = {"green": "●", "yellow": "◑", "red": "○"}[band]
+        vec_tag = f"  VEC={vec:.2f}{icon}"
+    except Exception:
+        pass
+
     print(
         f"\n  ┌─ {step.idx}/{total - 1}"
         f"  x={x:.4f}"
         f"  {state.species_a}={round(1 - x, 4)}"
         f"  {state.species_b}={round(x, 4)}"
+        f"{vec_tag}"
     )
-    print(f"  │  $ {cmd_display}")
+    print(f"  │  $ {cmd}")
 
 
 def print_step_result(
@@ -429,26 +489,22 @@ def print_step_result(
 
     if step.status == DONE:
         conv_marker = "✓" if step.geom_converged == "yes" else "⚠ not converged"
-        time_str = f"  ⏱ {float(step.wall_time_s):.0f}s" if step.wall_time_s else ""
-        bulk_str = (
-            f"  B={step.parsed.get('bulk_modulus_GPa', '')}GPa"
-            if step.parsed.get("bulk_modulus_GPa")
-            else ""
-        )
+        t_str = _fmt_time(float(step.wall_time_s)) if step.wall_time_s else "—"
+        a_str = f"a={step.a_opt_ang}Å" if step.a_opt_ang else ""
         print(
-            f"  └─ {conv_marker}"
-            f"  H={step.enthalpy_eV}"
-            f"  a={step.a_opt_ang}Å"
-            f"{bulk_str}{time_str}"
+            f"  │  ▶ Geometry Optimization … {conv_marker}"
+            f"  ({t_str})  [{a_str}  H={step.enthalpy_eV} eV]"
         )
         if "no empty bands" in step.warnings:
             print("  │  ⚠  Increase nextra_bands in .param (try 20 or 30)")
+        # Closing line printed by caller after elastic sub-step (if any)
         return
 
     # FAILED
-    print(f"  └─ ✗ FAILED (rc={step.rc})")
+    print(f"  │  ✗ FAILED (rc={step.rc})")
     useful_stderr = [
-        line for line in exec_result.stderr_tail
+        line
+        for line in exec_result.stderr_tail
         if line.strip() and "PMIX" not in line and not line.startswith("[")
     ][-5:]
     for line in useful_stderr:
@@ -458,8 +514,12 @@ def print_step_result(
     if castep_log.exists():
         all_lines = castep_log.read_text(errors="replace").splitlines()
         error_lines = [
-            ln for ln in all_lines[-40:]
-            if any(kw in ln.lower() for kw in ("error", "abort", "fatal", "failed", "warning"))
+            ln
+            for ln in all_lines[-40:]
+            if any(
+                kw in ln.lower()
+                for kw in ("error", "abort", "fatal", "failed", "warning")
+            )
         ]
         for line in error_lines[-4:]:
             print(f"     │ {line.strip()}")
@@ -469,6 +529,7 @@ def print_step_result(
 
     if step.warnings:
         print(f"     │ {step.warnings}")
+    print("  └─ ✗ Step failed.")
 
 
 def print_single_result(step: Step, seed: str) -> None:
@@ -496,7 +557,9 @@ def print_summary(state: RunState) -> None:
         f"  {'#':>3}  {'x':>7}  {'Status':<8}  {'H (eV)':>16}"
         f"  {'a (Å)':>8}  {'B (GPa)':>7}  conv"
     )
-    print(f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}")
+    print(
+        f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}"
+    )
 
     for step in steps:
         flag = " ⚠" if step.geom_converged == "no" and step.status == DONE else ""
@@ -511,8 +574,10 @@ def print_summary(state: RunState) -> None:
             f"  {(step.geom_converged or '—')}{flag}"
         )
 
-    counts = {st: sum(1 for s in steps if s.status == st)
-              for st in (DONE, SKIPPED, FAILED, PENDING)}
+    counts = {
+        st: sum(1 for s in steps if s.status == st)
+        for st in (DONE, SKIPPED, FAILED, PENDING)
+    }
     print(f"{'═' * W}")
     print(
         f"  ✓ {counts[DONE]}  ⊘ {counts[SKIPPED]}"
@@ -522,15 +587,9 @@ def print_summary(state: RunState) -> None:
     dh_data = mixing_enthalpy(steps)
     if dh_data:
         print("\n  ── H(x) deviation from Vegard linear mixing ─────────────────────")
-        print(
-            "  ⚠  VCA ΔH values are dominated by pseudopotential offsets between"
-        )
-        print(
-            "     species (~eV range), NOT chemical mixing energy (~meV range)."
-        )
-        print(
-            "     Use lattice parameter and Cij vs x for quantitative analysis."
-        )
+        print("  ⚠  VCA ΔH values are dominated by pseudopotential offsets between")
+        print("     species (~eV range), NOT chemical mixing energy (~meV range).")
+        print("     Use lattice parameter and Cij vs x for quantitative analysis.")
         print(f"\n  {'x':>7}   {'H_total (eV)':>16}   {'ΔH_Vegard (meV/cell)':>22}")
         print(f"  {'─' * 7}   {'─' * 16}   {'─' * 22}")
         for x_val, h_val, dh_val in dh_data:
@@ -538,3 +597,227 @@ def print_summary(state: RunState) -> None:
         print()
     elif counts[DONE] > 0 and counts[FAILED] == 0:
         print("  ⚠  ΔH skipped — x=0 or x=1 endpoint missing/not converged.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Draw Box
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def draw_box(lines: list[str], min_width: int = 70, padding: int = 2) -> str:
+    """
+    Малює адаптивну рамку навколо тексту.
+    Ширина рамки підлаштовується під найдовший рядок, але не менше min_width.
+    """
+    # Знаходимо найдовший рядок тексту
+    max_line_len = max(len(line) for line in lines) if lines else 0
+
+    # Визначаємо фінальну внутрішню ширину (враховуючи відступи)
+    inner_width = max(min_width, max_line_len + (padding * 2))
+
+    # Формуємо верхню та нижню межі
+    top_border = f"  ┌{'─' * inner_width}┐\n"
+    bottom_border = f"  └{'─' * inner_width}┘"
+
+    # Формуємо текстові рядки з вирівнюванням
+    box = [top_border]
+    for line in lines:
+        # :<{inner_width} вирівнює текст по лівому краю і заповнює залишок пробілами
+        # center() можна використати для вирівнювання по центру
+        padded_line = f"{' ' * padding}{line}"
+        box.append(f"  │{padded_line:<{inner_width}}│\n")
+    box.append(bottom_border)
+
+    return "".join(box)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VEC Stability Predictor
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def print_vec_stability_table(
+    species_a: str,
+    species_b: str,
+    concentrations: list[float],
+    nonmetal: str | None,
+) -> None:
+    """
+    Print a VEC stability table for all planned concentration steps.
+
+    Example output:
+      ── VEC Stability Forecast ──────────────────────────────────────
+       x       VEC    Status
+      ─────  ──────  ──────────────────────────────────────────────────
+       0.00   8.00   ● Stable — SCF converges quickly
+       0.25   8.25   ◑ Yellow zone — SCF may need extra iterations
+       0.50   8.50   ○ RED ZONE — Born instability likely (C44 → 0)
+    """
+    from elasticity import vec_for_concentration, vec_stability_band
+
+    _BAND_LABEL = {
+        "green": "● Stable — SCF converges quickly",
+        "yellow": "◑ Yellow zone — SCF may need extra iterations",
+        "red": "○ RED ZONE — Born instability likely (C44 → 0)",
+    }
+
+    print("\n  ── VEC Stability Forecast " + "─" * 46)
+    print(f"  {'x':>6}   {'VEC':>6}   Status")
+    print(f"  {'─' * 6}   {'─' * 6}   {'─' * 50}")
+    for x in concentrations:
+        vec = vec_for_concentration(species_a, species_b, x, nonmetal)
+        band = vec_stability_band(vec)
+        print(f"  {x:>6.4f}   {vec:>6.2f}   {_BAND_LABEL[band]}")
+    print()
+
+
+def ask_vec_guard(
+    species_a: str,
+    species_b: str,
+    concentrations: list[float],
+    nonmetal: str | None,
+    vec_threshold: float = 8.4,
+) -> list[float] | None:
+    """
+    Analyse VEC stability for all planned steps.  If any step has
+    VEC > vec_threshold, display an interactive warning and ask the user
+    whether to skip the dangerous steps or proceed anyway.
+
+    Returns
+    ───────
+    • list[float]   — concentrations to actually run (may be filtered)
+    • None          — if no steps exceed the threshold (nothing to do)
+
+    The VEC > 8.4 threshold corresponds to the Band Jahn-Teller instability
+    observed in Ti(1-x)Nb(x)C systems.  CASTEP will typically fail to
+    converge the SCF cycle or yield C44 < 0 for these compositions.
+    """
+    from elasticity import vec_for_concentration, vec_stability_band
+
+    red_steps = [
+        x
+        for x in concentrations
+        if vec_for_concentration(species_a, species_b, x, nonmetal) > vec_threshold
+    ]
+    if not red_steps:
+        return None  # all steps are safe — caller can proceed normally
+
+    # Find the first dangerous concentration to include in the warning
+    x_first_red = red_steps[0]
+    vec_first = vec_for_concentration(species_a, species_b, x_first_red, nonmetal)
+
+    # Boundary: last safe x
+    safe_steps = [x for x in concentrations if x not in red_steps]
+    x_safe_max = max(safe_steps) if safe_steps else None
+    skip_label = (
+        f"run only x ≤ {x_safe_max:.4f}"
+        if x_safe_max is not None
+        else "skip all unstable steps"
+    )
+
+    affected_steps_str = "  ".join(f"x={v:.4f}" for v in red_steps[:6])
+    if len(red_steps) > 6:
+        affected_steps_str += "  …"
+
+    # Передаємо текст як список рядків БЕЗ символів рамки
+    warning_lines = [
+        f"⚠  WARNING: High Valence Electron Concentration (VEC > {vec_threshold})",
+        f"   detected for x ≥ {x_first_red:.4f}  (VEC = {vec_first:.2f}).",
+        "",
+        f"VCA pseudo-atoms with VEC > {vec_threshold} exhibit strong electronic",
+        "instability (Band Jahn-Teller effect).  CASTEP will likely fail",
+        "to converge the SCF cycle or yield C44 < 0 (Born instability).",
+        "",
+        f"Affected steps ({len(red_steps)}):  {affected_steps_str}",
+        "",
+        f"[1]  Skip unstable steps ({skip_label})  ← Recommended",
+        "[2]  Proceed anyway  (may hang for hours or crash)",
+    ]
+
+    # Викликаємо функцію малювання та друкуємо
+    print(f"\n{draw_box(warning_lines, min_width=70)}")
+
+    while True:
+        try:
+            raw = input("  Choice [1]: ").strip()
+        except EOFError:
+            raw = "1"
+        if raw in {"", "1"}:
+            skipped_note = (
+                f"Only x ≤ {x_safe_max:.4f} will be computed."
+                if x_safe_max is not None
+                else "All planned steps are unstable and will be skipped."
+            )
+            print(
+                f"\n  ✓  Skipping {len(red_steps)} unstable step(s) with VEC > {vec_threshold}.\n"
+                f"     {skipped_note}\n"
+                f"     Elastic constants for skipped x will use Vegard interpolation.\n"
+            )
+            return safe_steps
+        if raw == "2":
+            print(
+                f"\n  ⚠  Proceeding with all steps.  Watch for 'Born stability violated'\n"
+                f"     in the elastic output for x ≥ {x_first_red:.4f}.\n"
+            )
+            return list(concentrations)
+        print("  Enter 1 or 2.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Elastic step inline display
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def print_elastic_progress(n_strains: int, vec: float, nextra: int) -> None:
+    """
+    Print the 'starting' line for the elastic sub-step.
+
+      │  ▶ Elastic Tensors (6 strains, nextra=19, VEC=8.30) ...
+    """
+    print(
+        f"  │  ▶ Elastic Tensors ({n_strains} strains,"
+        f"  nextra_bands={nextra},  VEC={vec:.2f}) …",
+        flush=True,
+    )
+
+
+def print_elastic_result(elastic_data: dict, elapsed_s: float) -> None:
+    """
+    Print the elastic result line integrated into the step box.
+
+    Success:
+      │  ▶ Elastic Tensors (6 strains) ... ✓ (1m 12s) [B=259 GPa, E=474 GPa]
+
+    Failure:
+      │  ⚠ Elasticity failed: Born stability violated (Expected for VEC > 8.4).
+    """
+    t = _fmt_time(elapsed_s)
+
+    if "_elastic_error" in elastic_data:
+        err = elastic_data["_elastic_error"]
+        print(f"  │  ⚠  Elasticity failed: {err}")
+        print("  └─ ✗ Elastic step failed.")
+        return
+
+    if "C11" not in elastic_data:
+        print("  │  ⚠  Elasticity: no usable data returned")
+        print("  └─ ✗ Elastic step failed.")
+        return
+
+    b = elastic_data.get("B_Hill_GPa", "—")
+    g = elastic_data.get("G_Hill_GPa", "—")
+    e = elastic_data.get("E_GPa", "—")
+    c11 = elastic_data.get("C11", "—")
+    c12 = elastic_data.get("C12", "—")
+    c44 = elastic_data.get("C44", "—")
+    src = elastic_data.get("elastic_source", "CASTEP")
+    tag = "  [Vegard]" if "Vegard" in src else ""
+    r2 = elastic_data.get("elastic_R2_min", "")
+    r2_tag = f"  R²={r2}" if r2 and r2 != "N/A" else ""
+    note = elastic_data.get("elastic_quality_note", "")
+
+    print(f"  │  ✓ Elastic Tensors ({t}){tag}  [B={b}  G={g}  E={e} GPa]{r2_tag}")
+    print(f"  │     C11={c11}  C12={c12}  C44={c44} GPa")
+    if note:
+        print(f"  │  ⚠  {note}")
+    print("  └─ ✓ Elastic step completed.")
