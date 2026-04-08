@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-from castep_io import atom_count
+
 from elasticity import (
     apply_strain_to_cell,
     fit_cij_from_stress,
@@ -43,12 +43,13 @@ from elasticity import (
     vec_for_concentration,
     write_cijdat,
 )
+from elastic_analysis import count_atoms_from_castep
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Cell preprocessing helpers  (unchanged — CASTEP-specific fixes)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_RE_MIXTURE = re.compile(r"\s+MIXTURE:\([^)]+\)", re.I)
+_RE_MIXTURE      = re.compile(r"\s+MIXTURE:\([^)]+\)", re.I)
 _RE_SYMMETRY_OPS = re.compile(
     r"%BLOCK\s+SYMMETRY_OPS.*?%ENDBLOCK\s+SYMMETRY_OPS\s*", re.DOTALL | re.I
 )
@@ -69,21 +70,15 @@ def _strip_geomopt_bookkeeping(cell_path: Path) -> None:
     cleaned = _RE_SYMMETRY_OPS.sub("", cleaned)
     cleaned = re.sub(
         r"#%BLOCK\s+SYMMETRY_OPS.*?#%ENDBLOCK\s+SYMMETRY_OPS\s*",
-        "",
-        cleaned,
-        flags=re.DOTALL | re.I,
+        "", cleaned, flags=re.DOTALL | re.I,
     )
-    cleaned = re.sub(
-        r"^#\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\s*$\n?", "", cleaned, flags=re.M
-    )
-    cleaned = re.sub(r"^# Symm\..*$\n?", "", cleaned, flags=re.M)
-    cleaned = re.sub(r"^\s*FIX_COM\s*:.*$\n?", "", cleaned, flags=re.M | re.I)
+    cleaned = re.sub(r"^#\s+[-\d.]+\s+[-\d.]+\s+[-\d.]+\s*$\n?", "", cleaned, flags=re.M)
+    cleaned = re.sub(r"^# Symm\..*$\n?",            "", cleaned, flags=re.M)
+    cleaned = re.sub(r"^\s*FIX_COM\s*:.*$\n?",      "", cleaned, flags=re.M | re.I)
     cleaned = re.sub(r"^\s*FIX_ALL_IONS\s*:.*$\n?", "", cleaned, flags=re.M | re.I)
     cleaned = re.sub(
         r"%BLOCK\s+CELL_CONSTRAINTS.*?%ENDBLOCK\s+CELL_CONSTRAINTS\s*",
-        "",
-        cleaned,
-        flags=re.DOTALL | re.I,
+        "", cleaned, flags=re.DOTALL | re.I,
     )
 
     if cleaned != text:
@@ -97,7 +92,7 @@ def _build_strain_source(orig_cell: Path, out_cell: Path, dest: Path) -> None:
     VCA .cell.  This avoids the ghost-species problem in CASTEP's -out.cell.
     """
     orig_text = orig_cell.read_text(encoding="utf-8", errors="replace")
-    out_text = out_cell.read_text(encoding="utf-8", errors="replace")
+    out_text  = out_cell.read_text(encoding="utf-8",  errors="replace")
 
     _RE_LAT = re.compile(
         r"(%BLOCK\s+LATTICE_CART\s*\n)(.*?)(%ENDBLOCK\s+LATTICE_CART)",
@@ -109,11 +104,7 @@ def _build_strain_source(orig_cell: Path, out_cell: Path, dest: Path) -> None:
         return
 
     new_lat = out_match.group(0)
-    result = (
-        _RE_LAT.sub(new_lat, orig_text)
-        if _RE_LAT.search(orig_text)
-        else new_lat + "\n" + orig_text
-    )
+    result  = _RE_LAT.sub(new_lat, orig_text) if _RE_LAT.search(orig_text) else new_lat + "\n" + orig_text
     dest.write_text(result, encoding="utf-8")
 
 
@@ -162,7 +153,6 @@ def _parse_lattice_code_from_castep(castep_path: Path) -> int | None:
 # .param builder — adaptive nextra_bands, tight elastic tolerances
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def _build_strained_param(
     orig_param: Path,
     x: float = 0.5,
@@ -188,12 +178,8 @@ def _build_strained_param(
     import re as _re
 
     _GEOM_KEYS = (
-        "geom_method",
-        "geom_max_iter",
-        "geom_energy_tol",
-        "geom_force_tol",
-        "geom_stress_tol",
-        "geom_disp_tol",
+        "geom_method", "geom_max_iter", "geom_energy_tol",
+        "geom_force_tol", "geom_stress_tol", "geom_disp_tol",
     )
 
     if orig_param.exists():
@@ -214,16 +200,16 @@ def _build_strained_param(
 
     nextra = nextra_bands_for(x, vec)
 
-    text = _set(text, "task", "SinglePoint")
-    text = _set(text, "calculate_stress", "true")
-    text = _set(text, "elec_energy_tol", "1.0e-7 eV")
-    text = _set(text, "finite_basis_corr", "1")
-    text = _set(text, "nextra_bands", str(nextra))
-    text = _set(text, "spin_polarized", "false")
-    text = _set(text, "mix_charge_amp", "0.1")
-    text = _set(text, "opt_strategy", "speed")
-    text = _set(text, "write_checkpoint", "none")
-    text = _set(text, "num_dump_cycles", "0")
+    text = _set(text, "task",                "SinglePoint")
+    text = _set(text, "calculate_stress",    "true")
+    text = _set(text, "elec_energy_tol",     "1.0e-7 eV")
+    text = _set(text, "finite_basis_corr",   "1")
+    text = _set(text, "nextra_bands",        str(nextra))
+    text = _set(text, "spin_polarized",      "false")
+    text = _set(text, "mix_charge_amp",      "0.1")
+    text = _set(text, "opt_strategy",        "speed")
+    text = _set(text, "write_checkpoint",    "none")
+    text = _set(text, "num_dump_cycles",     "0")
     text = _set(text, "write_cell_structure", "false")  # suppress -out.cell
 
     for kw in _GEOM_KEYS:
@@ -286,14 +272,12 @@ def run_finite_strain_elastic(
     vec = vec_for_concentration(species_a, species_b, x, nonmetal)
 
     # ── Build strain source cell ──────────────────────────────────────────────
-    out_cell = seed_dir / f"{seed}-out.cell"
+    out_cell  = seed_dir / f"{seed}-out.cell"
     orig_cell = seed_dir / f"{seed}.cell"
     base_cell = seed_dir / f"{seed}_strain_src.cell"
 
     if not orig_cell.exists() and not out_cell.exists():
-        return {
-            "_elastic_error": f"no {seed}.cell or {seed}-out.cell in {seed_dir.name}"
-        }
+        return {"_elastic_error": f"no {seed}.cell or {seed}-out.cell in {seed_dir.name}"}
 
     if out_cell.exists() and orig_cell.exists():
         _build_strain_source(orig_cell, out_cell, base_cell)
@@ -309,7 +293,7 @@ def run_finite_strain_elastic(
     if lattice_vecs is None:
         return {"_elastic_error": "cannot parse LATTICE_CART from strain source cell"}
 
-    castep_out = seed_dir / f"{seed}.castep"
+    castep_out   = seed_dir / f"{seed}.castep"
     lattice_code = _parse_lattice_code_from_castep(castep_out) or 5  # default cubic
 
     # ── Generate strain steps (pure Python) ──────────────────────────────────
@@ -351,13 +335,8 @@ def run_finite_strain_elastic(
         cmd = castep_cmd.replace("{seed}", ss)
         try:
             subprocess.run(
-                cmd,
-                shell=True,
-                cwd=seed_dir,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
+                cmd, shell=True, cwd=seed_dir, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
             )
         except OSError as exc:
             _log(f"  ✗  OS error running CASTEP for {ss}: {exc}")
@@ -365,14 +344,12 @@ def run_finite_strain_elastic(
             continue
 
         castep_log = seed_dir / f"{ss}.castep"
-        err_files = sorted(seed_dir.glob(f"{ss}*.err"))
-        empty = not castep_log.exists() or castep_log.stat().st_size < 100
+        err_files  = sorted(seed_dir.glob(f"{ss}*.err"))
+        empty      = not castep_log.exists() or castep_log.stat().st_size < 100
 
         if err_files or empty:
             for ef in err_files:
-                err_lines = [
-                    l for l in ef.read_text(errors="replace").splitlines() if l.strip()
-                ][:2]
+                err_lines = [l for l in ef.read_text(errors="replace").splitlines() if l.strip()][:2]
                 for ln in err_lines:
                     _log(f"  ✗  [{ss}] {ln}")
             if empty and not err_files:
@@ -383,24 +360,20 @@ def run_finite_strain_elastic(
             for pat in _CLEANUP_GLOBS:
                 prefix = ss
                 for f in seed_dir.glob(f"{prefix}{pat.lstrip('*')}"):
-                    try:
-                        f.unlink()
-                    except OSError:
-                        pass
+                    try: f.unlink()
+                    except OSError: pass
 
     n_ok = len(strained_seeds) - len(failed)
     if n_ok < 3:
-        return {
-            "_elastic_error": f"only {n_ok}/{len(strained_seeds)} CASTEP runs succeeded"
-        }
+        return {"_elastic_error": f"only {n_ok}/{len(strained_seeds)} CASTEP runs succeeded"}
 
     # Read n_atoms from the GeomOpt .castep (not strained) for Debye calculation
-    n_atoms = atom_count(castep_out)
+    n_atoms = count_atoms_from_castep(castep_out)
 
     # ── Collect stress / strain pairs ─────────────────────────────────────────
     stresses: list[np.ndarray] = []
-    strains: list[np.ndarray] = []
-    missing: list[str] = []
+    strains:  list[np.ndarray] = []
+    missing:  list[str] = []
 
     for ss, step in zip(strained_seeds, strain_steps):
         sv = read_stress(seed_dir / f"{ss}.castep")
@@ -412,17 +385,12 @@ def run_finite_strain_elastic(
 
     if missing:
         n_miss = len(missing)
-        _log(
-            f"  ⚠  stress missing from {n_miss} cell(s): "
-            + ", ".join(missing[:3])
-            + (f" (+{n_miss - 3} more)" if n_miss > 3 else "")
-        )
+        _log(f"  ⚠  stress missing from {n_miss} cell(s): "
+             + ", ".join(missing[:3]) + (f" (+{n_miss-3} more)" if n_miss > 3 else ""))
 
     # ── Fit Cij ───────────────────────────────────────────────────────────────
     elastic_data = fit_cij_from_stress(
-        stresses,
-        strains,
-        lattice_code,
+        stresses, strains, lattice_code,
         density_gcm3=density_gcm3,
         n_atoms_per_cell=n_atoms if n_atoms > 0 else None,
         volume_ang3=volume_ang3,
@@ -464,20 +432,10 @@ def run_finite_strain_elastic(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _INTERP_KEYS = (
-    "C11",
-    "C12",
-    "C44",
-    "B_Voigt_GPa",
-    "B_Reuss_GPa",
-    "B_Hill_GPa",
-    "G_Voigt_GPa",
-    "G_Reuss_GPa",
-    "G_Hill_GPa",
-    "E_GPa",
-    "nu",
-    "Zener_A",
-    "Pugh_ratio",
-    "Cauchy_pressure_GPa",
+    "C11", "C12", "C44",
+    "B_Voigt_GPa", "B_Reuss_GPa", "B_Hill_GPa",
+    "G_Voigt_GPa", "G_Reuss_GPa", "G_Hill_GPa",
+    "E_GPa", "nu", "Zener_A", "Pugh_ratio", "Cauchy_pressure_GPa",
 )
 
 
@@ -515,8 +473,8 @@ def interpolate_elastic_vegard(
             continue
 
     if result:
-        result["elastic_source"] = "Vegard_interpolation"
+        result["elastic_source"]   = "Vegard_interpolation"
         result["elastic_n_points"] = "0"
-        result["elastic_R2_min"] = "N/A"
+        result["elastic_R2_min"]   = "N/A"
 
     return result

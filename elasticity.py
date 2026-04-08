@@ -189,67 +189,117 @@ class StrainStep:
 
 
 
+def lattice_to_abc_angles(lattice_vecs: np.ndarray) -> tuple[float, float, float,
+                                                                float, float, float]:
+    """
+    Compute lattice parameters (a, b, c, α, β, γ) from Cartesian lattice vectors.
+    Returns angles in degrees.  Pure numpy — no ASE dependency.
+    """
+    a = float(np.linalg.norm(lattice_vecs[0]))
+    b = float(np.linalg.norm(lattice_vecs[1]))
+    c = float(np.linalg.norm(lattice_vecs[2]))
+
+    # Clamp dot-product to [-1, 1] to avoid acos domain errors from float noise
+    cos_alpha = float(np.clip(np.dot(lattice_vecs[1], lattice_vecs[2]) / (b * c), -1, 1))
+    cos_beta  = float(np.clip(np.dot(lattice_vecs[0], lattice_vecs[2]) / (a * c), -1, 1))
+    cos_gamma = float(np.clip(np.dot(lattice_vecs[0], lattice_vecs[1]) / (a * b), -1, 1))
+
+    alpha = float(np.degrees(np.arccos(cos_alpha)))
+    beta  = float(np.degrees(np.arccos(cos_beta)))
+    gamma = float(np.degrees(np.arccos(cos_gamma)))
+
+    return a, b, c, alpha, beta, gamma
+
+
+def _cell_volume(lattice_vecs: np.ndarray) -> float:
+    """Cell volume from lattice vectors (scalar triple product)."""
+    return abs(float(np.dot(lattice_vecs[0], np.cross(lattice_vecs[1], lattice_vecs[2]))))
+
+
 def standardize_cubic_cell(lattice_vecs: np.ndarray) -> np.ndarray:
     """
-    Convert a non-orthogonal (primitive) cubic cell to an orthogonal
-    conventional form before generating finite-difference strain patterns.
+    Convert a non-orthogonal primitive cubic cell to a canonical orthogonal
+    form for use in finite-difference strain pattern generation.
 
     Why this is required
     ────────────────────
-    cif2cell and CASTEP output primitive FCC/BCC cells with non-orthogonal
-    lattice vectors (e.g. TiC FCC: a=[2.165, 2.165, 0], b=[2.165, 0, 2.165]).
-    When a Voigt strain e1+e4 is applied to these axes, the physical
-    deformation is NOT aligned with [100]/[010]/[001] — it is rotated by 45°.
-    The stress tensor returned by CASTEP is in the Cartesian lab frame, so
-    the regression C11=∂σ₁₁/∂ε₁₁ uses incompatible axes → negative C11.
+    cif2cell and CASTEP write primitive FCC/BCC cells with non-orthogonal
+    vectors (e.g. TiC rocksalt: a=[2.165, 2.165, 0], b=[2.165, 0, 2.165]).
+    The Voigt strain e1+e4 must be applied along [100]/[010]/[001] — but
+    in a non-orthogonal primitive cell those axes are rotated.  CASTEP
+    returns stress in the Cartesian lab frame, so the regression
+    C11=∂σ₁₁/∂ε₁₁ uses misaligned strains → unphysical negative C11.
 
-    Solution: before generating strain patterns, transform to an equivalent
-    orthogonal description.  For cubic symmetry this means:
-      a_conv = a_prim * sqrt(2)   (for FCC primitive → conventional)
-    and use a_conv * I₃ as the lattice for strain generation.
+    Only strain MAGNITUDES use the standardized cell.  The actual strained
+    .cell files are built from the real LATTICE_CART by apply_strain_to_cell,
+    so CASTEP always receives physically correct geometries.
 
-    The CASTEP SinglePoint cells use the ACTUAL (strained) primitive lattice
-    (via apply_strain_to_cell which modifies LATTICE_CART) — so the stress
-    output is still in the correct physical frame.  Only the STRAIN MAGNITUDE
-    computation in generate_strain_steps uses this orthogonal reference.
+    Algorithm (no ASE)
+    ──────────────────
+    1. Compute (a, b, c, α, β, γ) from the Cartesian vectors.
+    2. Classify the Bravais lattice from the metric tensor:
+         - All lengths equal, all angles equal ≈ 60°  → FCC primitive
+           Conventional cubic: a_conv = a_prim × √2
+         - All lengths equal, all angles equal ≈ 109.47° → BCC primitive
+           Conventional cubic: a_conv = a_prim × 2/√3
+         - All lengths equal, all angles ≈ 90° → already simple cubic (SC)
+           No transformation needed.
+         - All angles 90°, lengths may differ → orthorhombic (return as-is,
+           no re-orientation needed for Voigt strains).
+         - Otherwise → return unchanged (general non-cubic case).
+    3. Return a_conv × I₃ for the cubic cases.
 
-    Detection: if all three vector lengths are equal AND all pairwise dot
-    products are equal and non-zero → FCC or BCC primitive cell.
+    Tolerances
+    ──────────
+    Angle equality: ±1.5° (generous for relaxed cells with small asymmetry).
+    Length equality: relative tolerance 0.5%.
     """
-    a_len = np.linalg.norm(lattice_vecs[0])
-    b_len = np.linalg.norm(lattice_vecs[1])
-    c_len = np.linalg.norm(lattice_vecs[2])
+    a, b, c, alpha, beta, gamma = lattice_to_abc_angles(lattice_vecs)
 
-    # All vectors equal length?
-    if not (abs(a_len - b_len) < 1e-4 and abs(a_len - c_len) < 1e-4):
-        return lattice_vecs  # not a simple cubic-type primitive cell
+    # ── Check length equality (relative) ──────────────────────────────────────
+    avg_len = (a + b + c) / 3.0
+    lengths_equal = (
+        abs(a - avg_len) / avg_len < 0.005 and
+        abs(b - avg_len) / avg_len < 0.005 and
+        abs(c - avg_len) / avg_len < 0.005
+    )
 
-    # All pairwise dot products equal? (FCC: cos(60°)=0.5, BCC: cos(109.47°)=-1/3)
-    dot_ab = float(np.dot(lattice_vecs[0], lattice_vecs[1]))
-    dot_ac = float(np.dot(lattice_vecs[0], lattice_vecs[2]))
-    dot_bc = float(np.dot(lattice_vecs[1], lattice_vecs[2]))
-    dots_equal = abs(dot_ab - dot_ac) < 1e-4 and abs(dot_ab - dot_bc) < 1e-4
+    # ── Already orthogonal? ───────────────────────────────────────────────────
+    angles_90 = (
+        abs(alpha - 90.0) < 1.5 and
+        abs(beta  - 90.0) < 1.5 and
+        abs(gamma - 90.0) < 1.5
+    )
+    if angles_90:
+        # Orthorhombic / tetragonal / cubic SC — already aligned, no change
+        return lattice_vecs
 
-    if not dots_equal or abs(dot_ab) < 1e-4:
-        return lattice_vecs  # already orthogonal or not a known type
+    if not lengths_equal:
+        # Non-cubic non-orthogonal (monoclinic etc.) — return unchanged
+        return lattice_vecs
 
-    cos_angle = dot_ab / (a_len * a_len)
+    # ── All lengths equal and non-orthogonal → primitive cubic ───────────────
+    avg_angle = (alpha + beta + gamma) / 3.0
 
-    # FCC primitive: cos(60°) = 0.5  → a_conv = a_prim * sqrt(2)
-    if abs(cos_angle - 0.5) < 0.02:
-        a_conv = a_len * np.sqrt(2.0)
-        return np.array([[a_conv, 0.0, 0.0],
-                         [0.0, a_conv, 0.0],
-                         [0.0, 0.0, a_conv]])
+    # FCC primitive: all angles ≈ 60°
+    # Volume check: V_prim_FCC = a_conv³ / 4  → a_conv = (4V)^(1/3)
+    if abs(avg_angle - 60.0) < 1.5:
+        vol = _cell_volume(lattice_vecs)
+        a_conv = (4.0 * vol) ** (1.0 / 3.0)
+        return np.diag([a_conv, a_conv, a_conv])
 
-    # BCC primitive: cos(109.47°) ≈ -1/3  → a_conv = a_prim * 2/sqrt(3)
-    if abs(cos_angle + 1.0 / 3.0) < 0.02:
-        a_conv = a_len * 2.0 / np.sqrt(3.0)
-        return np.array([[a_conv, 0.0, 0.0],
-                         [0.0, a_conv, 0.0],
-                         [0.0, 0.0, a_conv]])
+    # BCC primitive: all angles ≈ 109.47°
+    # Volume check: V_prim_BCC = a_conv³ / 2  → a_conv = (2V)^(1/3)
+    if abs(avg_angle - 109.47) < 1.5:
+        vol = _cell_volume(lattice_vecs)
+        a_conv = (2.0 * vol) ** (1.0 / 3.0)
+        return np.diag([a_conv, a_conv, a_conv])
 
-    return lattice_vecs  # unknown primitive type — return as-is
+    # Rhombohedral (trigonal) or other equal-length non-orthogonal:
+    # Use the conventional cell volume approach generically.
+    # For simple cubic rotated: volume = a³, angles ≠ 90° only if tilted.
+    # Fall through to unchanged.
+    return lattice_vecs
 
 def generate_strain_steps(
     lattice_vecs: np.ndarray,     # shape (3, 3), rows = vectors in Å

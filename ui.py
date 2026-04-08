@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,7 @@ VERSION = "5.2"
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _fmt_time(seconds: float) -> str:
     """Format a duration as '45s' or '1m 12s'."""
@@ -133,8 +135,15 @@ _TASKS = [
 _NCP_ONLY_TASKS = ["ElasticConstants", "Phonon"]
 
 _XC_FUNCTIONALS = [
-    "PBE", "PBEsol", "WC", "PW91", "RPBE",
-    "LDA", "RSCAN", "PBE0", "HSE06",
+    "PBE",
+    "PBEsol",
+    "WC",
+    "PW91",
+    "RPBE",
+    "LDA",
+    "RSCAN",
+    "PBE0",
+    "HSE06",
 ]
 
 
@@ -220,7 +229,9 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     else:
         print("  │  500 eV — production quality for metals/alloys (USP)")
         print("  │  700 eV — mandatory for hard elements (C, N, O, F)")
-    raw_cutoff = ask_str(f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff))
+    raw_cutoff = ask_str(
+        f"Cut-off energy [{recommended_cutoff}]: ", str(recommended_cutoff)
+    )
     try:
         cut_off_energy = max(int(float(raw_cutoff.split()[0])), 100)
     except ValueError:
@@ -252,7 +263,15 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
         print("  ✓  .cell updated with NCP pseudopotentials")
     print()
 
-    castep_io.write_param(param_path, task, xc, cut_off_energy, spin_polarized, nextra_bands, ncp=needs_ncp)
+    castep_io.write_param(
+        param_path,
+        task,
+        xc,
+        cut_off_energy,
+        spin_polarized,
+        nextra_bands,
+        ncp=needs_ncp,
+    )
     print(f"  ✓ Written: {param_path.name}")
     return param_path
 
@@ -279,9 +298,7 @@ def _warn_cell_size(cell_path: Path) -> None:
         )
 
 
-def wizard_species(
-    cell_path: Path, cli_species: list[str] | None
-) -> tuple[str, str]:
+def wizard_species(cell_path: Path, cli_species: list[str] | None) -> tuple[str, str]:
     """
     Determine (species_a, species_b) pair for a VCA sweep.
 
@@ -316,7 +333,9 @@ def wizard_species(
     print("  x=0 → pure A (the element you substitute FROM)")
     print("  x=1 → pure B (the element you substitute TO)")
     print("  All other sublattices (e.g. C in TiC) stay unchanged.")
-    print("  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc.")
+    print(
+        "  Tip: enter the same element twice (e.g. Ti Ti) to run a single-compound calc."
+    )
 
     while True:
         default_a = found_species[0] if found_species else ""
@@ -327,7 +346,9 @@ def wizard_species(
             print("  ⚠  Required.")
             continue
         if species_a not in found_species:
-            print(f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})")
+            print(
+                f"  ⚠  '{species_a}' not in .cell  (found: {', '.join(found_species)})"
+            )
             continue
 
         raw_b = ask_str(f"  Replace {species_a} with (or same for single-compound): ")
@@ -339,7 +360,9 @@ def wizard_species(
 
         # A == B → signal single_mode by returning identical pair; main.py detects this
         if species_a == species_b:
-            print(f"  ℹ  A == B ({species_a}) → will run as single-compound calculation.")
+            print(
+                f"  ℹ  A == B ({species_a}) → will run as single-compound calculation."
+            )
             _warn_cell_size(cell_path)
             return species_a, species_b
 
@@ -361,52 +384,169 @@ def wizard_species(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CASTEP binary auto-discovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Common install locations to probe when castep.mpi is not in PATH.
+# Ordered from most-specific to most-generic.
+_CASTEP_SEARCH_DIRS = [
+    "~/Applications/CASTEP*/bin/linux*/castep.mpi",
+    "~/castep*/bin/linux*/castep.mpi",
+    "/opt/castep*/bin/castep.mpi",
+    "/usr/local/bin/castep.mpi",
+    "/usr/bin/castep.mpi",
+    "~/bin/castep.mpi",
+]
+
+_CASTEP_SERIAL_NAMES = ["castep.serial", "castep"]
+
+
+def _find_castep_binary() -> str | None:
+    """
+    Auto-discover the CASTEP MPI binary without any user interaction.
+
+    Search order:
+      1. PATH  (castep.mpi, then castep.serial, then castep)
+      2. Common installation directories via glob expansion
+      3. Returns None if nothing is found
+    """
+    import glob as _glob
+
+    # 1. PATH
+    for name in ["castep.mpi"] + _CASTEP_SERIAL_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+
+    # 2. Common directories (glob, expand ~)
+    for pattern in _CASTEP_SEARCH_DIRS:
+        matches = sorted(_glob.glob(os.path.expanduser(pattern)))
+        if matches:
+            return matches[-1]  # most recent version (alphabetically last)
+
+    return None
+
+
+def _build_castep_cmd(bin_path: str, n_cores: int) -> str:
+    """
+    Build the final CASTEP command from a binary path and core count.
+    Uses mpirun for .mpi binaries, plain path for serial.
+    """
+    name = Path(bin_path).name
+    if "mpi" in name.lower():
+        return f"mpirun -n {n_cores} {bin_path} {{seed}}"
+    return f"{bin_path} {{seed}}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CASTEP command wizard
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def wizard_castep_cmd(override: str | None) -> str:
     """
-    Resolve the engine MPI command string.
-    Prompts for MPI process count, then validates the binary exists.
-    Returns empty string for prepare-only mode.
-    The default binary and command template come from ACTIVE_ENGINE in castep_io.py.
+    Resolve the CASTEP command string with minimal friction.
+
+    UX design
+    ─────────
+    The user should never need to type a full path manually.
+    This wizard:
+      1. If --castep-cmd was supplied → extract binary, validate, ask cores only.
+      2. Otherwise → auto-discover binary, show what was found, ask cores only.
+      3. If auto-discovery fails → ask for path once, then ask cores.
+      4. 'skip' at any prompt → prepare-only mode (no CASTEP runs).
+
+    The final command is always of the form:
+        mpirun -n N /path/to/castep.mpi {seed}   (MPI binary)
+        /path/to/castep.serial {seed}             (serial binary)
+
+    The user never needs to type {seed} — it is appended automatically.
     """
-    engine = ACTIVE_ENGINE
     cpu_count = multiprocessing.cpu_count()
-    print(f"\n── {engine.name} — Parallelisation ──")
+
+    # ── Extract binary from --castep-cmd if supplied ──────────────────────────
+    if override:
+        # Accept any of these forms:
+        #   mpirun -n 6 /path/castep.mpi {seed}
+        #   /path/castep.mpi {seed}
+        #   /path/castep.mpi
+        #   mpirun -n 6 /path/castep.mpi
+        # We extract only the binary (the last token that looks like a path)
+        tokens = override.replace("{seed}", "").split()
+        bin_path = None
+        for tok in reversed(tokens):
+            tok_exp = os.path.expanduser(tok)
+            if "castep" in tok.lower() or Path(tok_exp).is_file():
+                bin_path = tok_exp
+                break
+        if bin_path is None:
+            bin_path = os.path.expanduser(tokens[-1]) if tokens else ""
+    else:
+        bin_path = _find_castep_binary()
+
+    print(f"\n── CASTEP — setup ──")
     print(f"  This machine: {cpu_count} logical cores")
-    default_cores = min(cpu_count, 6)
-    raw_cores = ask_str(f"MPI processes [{default_cores}]: ", str(default_cores))
+
+    # ── Validate binary or ask for it ─────────────────────────────────────────
+    while True:
+        if bin_path and cmd_is_valid(bin_path):
+            print(f"  Binary : {bin_path}  ✓")
+            break
+        if bin_path:
+            print(f"  ✗  Not found: {bin_path!r}")
+        else:
+            print("  ✗  CASTEP binary not found in PATH or common install locations.")
+
+        print("  Enter path to castep.mpi  (or 'skip' for prepare-only mode):")
+        answer = ask_str("  Path: ").strip()
+        if answer.lower() == "skip":
+            print(
+                "  Prepare-only mode — .cell files will be written but CASTEP won't run."
+            )
+            return ""
+        bin_path = os.path.expanduser(answer)
+
+    # ── Ask for MPI process count ──────────────────────────────────────────────
+    raw_cores = ask_str(f"  MPI processes [{cpu_count}]: ", str(cpu_count))
     try:
         n_cores = max(1, int(raw_cores))
     except ValueError:
-        n_cores = default_cores
+        n_cores = cpu_count
 
-    if override:
-        cmd = override.replace("{ncores}", str(n_cores))
-    else:
-        bin_path = os.path.expanduser(engine.default_bin)
-        cmd = engine.cmd_template.format(bin=bin_path, ncores=n_cores, seed="{seed}")
+    cmd = _build_castep_cmd(bin_path, n_cores)
+    print(f"  Command: {cmd.replace('{seed}', '<seed>')}")
+    return cmd
 
-    cmd = os.path.expanduser(cmd.replace("{ncores}", str(n_cores)))
-    print(f"\n── {engine.name} command ──\n  {cmd}")
 
-    binary_part = cmd.replace("{seed}", "").strip()
-    if cmd_is_valid(binary_part):
-        print("  Binary : OK ✓")
-        return cmd
+# ─────────────────────────────────────────────────────────────────────────────
+# Draw box
+# ─────────────────────────────────────────────────────────────────────────────
 
-    print("  ⚠  Binary not found.")
-    while True:
-        answer = ask_str("[Enter] fix command  /  'skip' = prepare .cell files only: ")
-        if answer.lower() == "skip":
-            print("  Prepare-only mode — no CASTEP will run.")
-            return ""
-        new_cmd = answer.replace("{ncores}", str(n_cores))
-        if cmd_is_valid(new_cmd.replace("{seed}", "").strip()):
-            return new_cmd
-        print(f"  Not found: {new_cmd.split()[0]!r}")
+import textwrap
+
+
+def draw_box(text: str, width: int = 74, padding: int = 2) -> str:
+    """
+    Draw an ASCII box around multiline text, wrapping long lines automatically.
+    Maintains the UI style of vca_tool.
+    """
+    inner_width = width - (padding * 2) - 2
+    out_lines = [f"  ┌{'─' * (width - 2)}┐"]
+
+    for paragraph in text.splitlines():
+        if not paragraph.strip():
+            # Preserve empty lines
+            out_lines.append(f"  │{' ' * (width - 2)}│")
+            continue
+
+        # Wrap long paragraphs safely
+        wrapped = textwrap.wrap(paragraph, width=inner_width)
+        for line in wrapped:
+            # Left-align the text, pad the right side with spaces
+            out_lines.append(f"  │{' ' * padding}{line:<{inner_width}}{' ' * padding}│")
+
+    out_lines.append(f"  └{'─' * (width - 2)}┘")
+    return "\n".join(out_lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,7 +555,7 @@ def wizard_castep_cmd(override: str | None) -> str:
 
 
 def print_step_header(step: Step, total: int, state: RunState) -> None:
-    x   = step.concentration
+    x = step.concentration
     cmd = (
         state.castep_cmd.replace("{seed}", state.seed)
         if state.castep_cmd
@@ -424,18 +564,20 @@ def print_step_header(step: Step, total: int, state: RunState) -> None:
     # Inline VEC annotation
     vec_tag = ""
     try:
-        from elasticity import vec_for_concentration, vec_stability_band
         from castep_io import _NONMETALS as _NM
-        all_sp  = castep_io.read_species(
-            state.proj_dir.parent / f"{state.seed}.cell"
-        )
+        from elasticity import vec_for_concentration, vec_stability_band
+
+        all_sp = castep_io.read_species(state.proj_dir.parent / f"{state.seed}.cell")
         nonmetal = next(
-            (s for s in all_sp
-             if s.capitalize() in _NM
-             and s.capitalize() not in {state.species_a, state.species_b}),
+            (
+                s
+                for s in all_sp
+                if s.capitalize() in _NM
+                and s.capitalize() not in {state.species_a, state.species_b}
+            ),
             None,
         )
-        vec  = vec_for_concentration(state.species_a, state.species_b, x, nonmetal)
+        vec = vec_for_concentration(state.species_a, state.species_b, x, nonmetal)
         band = vec_stability_band(vec)
         icon = {"green": "●", "yellow": "◑", "red": "○"}[band]
         vec_tag = f"  VEC={vec:.2f}{icon}"
@@ -479,7 +621,8 @@ def print_step_result(
     # FAILED
     print(f"  │  ✗ FAILED (rc={step.rc})")
     useful_stderr = [
-        line for line in exec_result.stderr_tail
+        line
+        for line in exec_result.stderr_tail
         if line.strip() and "PMIX" not in line and not line.startswith("[")
     ][-5:]
     for line in useful_stderr:
@@ -489,8 +632,12 @@ def print_step_result(
     if castep_log.exists():
         all_lines = castep_log.read_text(errors="replace").splitlines()
         error_lines = [
-            ln for ln in all_lines[-40:]
-            if any(kw in ln.lower() for kw in ("error", "abort", "fatal", "failed", "warning"))
+            ln
+            for ln in all_lines[-40:]
+            if any(
+                kw in ln.lower()
+                for kw in ("error", "abort", "fatal", "failed", "warning")
+            )
         ]
         for line in error_lines[-4:]:
             print(f"     │ {line.strip()}")
@@ -528,7 +675,9 @@ def print_summary(state: RunState) -> None:
         f"  {'#':>3}  {'x':>7}  {'Status':<8}  {'H (eV)':>16}"
         f"  {'a (Å)':>8}  {'B (GPa)':>7}  conv"
     )
-    print(f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}")
+    print(
+        f"  {'─' * 3}  {'─' * 7}  {'─' * 8}  {'─' * 16}  {'─' * 8}  {'─' * 7}  {'─' * 4}"
+    )
 
     for step in steps:
         flag = " ⚠" if step.geom_converged == "no" and step.status == DONE else ""
@@ -543,8 +692,10 @@ def print_summary(state: RunState) -> None:
             f"  {(step.geom_converged or '—')}{flag}"
         )
 
-    counts = {st: sum(1 for s in steps if s.status == st)
-              for st in (DONE, SKIPPED, FAILED, PENDING)}
+    counts = {
+        st: sum(1 for s in steps if s.status == st)
+        for st in (DONE, SKIPPED, FAILED, PENDING)
+    }
     print(f"{'═' * W}")
     print(
         f"  ✓ {counts[DONE]}  ⊘ {counts[SKIPPED]}"
@@ -554,15 +705,9 @@ def print_summary(state: RunState) -> None:
     dh_data = mixing_enthalpy(steps)
     if dh_data:
         print("\n  ── H(x) deviation from Vegard linear mixing ─────────────────────")
-        print(
-            "  ⚠  VCA ΔH values are dominated by pseudopotential offsets between"
-        )
-        print(
-            "     species (~eV range), NOT chemical mixing energy (~meV range)."
-        )
-        print(
-            "     Use lattice parameter and Cij vs x for quantitative analysis."
-        )
+        print("  ⚠  VCA ΔH values are dominated by pseudopotential offsets between")
+        print("     species (~eV range), NOT chemical mixing energy (~meV range).")
+        print("     Use lattice parameter and Cij vs x for quantitative analysis.")
         print(f"\n  {'x':>7}   {'H_total (eV)':>16}   {'ΔH_Vegard (meV/cell)':>22}")
         print(f"  {'─' * 7}   {'─' * 16}   {'─' * 22}")
         for x_val, h_val, dh_val in dh_data:
@@ -575,6 +720,7 @@ def print_summary(state: RunState) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # VEC Stability Predictor
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def print_vec_stability_table(
     species_a: str,
@@ -596,16 +742,16 @@ def print_vec_stability_table(
     from elasticity import vec_for_concentration, vec_stability_band
 
     _BAND_LABEL = {
-        "green":  "● Stable — SCF converges quickly",
+        "green": "● Stable — SCF converges quickly",
         "yellow": "◑ Yellow zone — SCF may need extra iterations",
-        "red":    "○ RED ZONE — Born instability likely (C44 → 0)",
+        "red": "○ RED ZONE — Born instability likely (C44 → 0)",
     }
 
     print("\n  ── VEC Stability Forecast " + "─" * 46)
     print(f"  {'x':>6}   {'VEC':>6}   Status")
-    print(f"  {'─'*6}   {'─'*6}   {'─'*50}")
+    print(f"  {'─' * 6}   {'─' * 6}   {'─' * 50}")
     for x in concentrations:
-        vec  = vec_for_concentration(species_a, species_b, x, nonmetal)
+        vec = vec_for_concentration(species_a, species_b, x, nonmetal)
         band = vec_stability_band(vec)
         print(f"  {x:>6.4f}   {vec:>6.2f}   {_BAND_LABEL[band]}")
     print()
@@ -635,7 +781,8 @@ def ask_vec_guard(
     from elasticity import vec_for_concentration, vec_stability_band
 
     red_steps = [
-        x for x in concentrations
+        x
+        for x in concentrations
         if vec_for_concentration(species_a, species_b, x, nonmetal) > vec_threshold
     ]
     if not red_steps:
@@ -643,30 +790,32 @@ def ask_vec_guard(
 
     # Find the first dangerous concentration to include in the warning
     x_first_red = red_steps[0]
-    vec_first   = vec_for_concentration(species_a, species_b, x_first_red, nonmetal)
+    vec_first = vec_for_concentration(species_a, species_b, x_first_red, nonmetal)
 
     # Boundary: last safe x
     safe_steps = [x for x in concentrations if x not in red_steps]
     x_safe_max = max(safe_steps) if safe_steps else None
-    skip_label = f"run only x ≤ {x_safe_max:.4f}" if x_safe_max is not None else "skip all unstable steps"
-
-    print(
-        f"\n  ┌{'─' * 70}\n"
-        f"  │  ⚠  WARNING: High Valence Electron Concentration (VEC > {vec_threshold})\n"
-        f"  │     detected for x ≥ {x_first_red:.4f}  (VEC = {vec_first:.2f}).\n"
-        f"  │\n"
-        f"  │  VCA pseudo-atoms with VEC > {vec_threshold} exhibit strong electronic\n"
-        f"  │  instability (Band Jahn-Teller effect).  CASTEP will likely fail\n"
-        f"  │  to converge the SCF cycle or yield C44 < 0 (Born instability).\n"
-        f"  │\n"
-        f"  │  Affected steps ({len(red_steps)}):  "
-        + "  ".join(f"x={v:.4f}" for v in red_steps[:6])
-        + ("  …" if len(red_steps) > 6 else "")
-        + f"\n  │\n"
-        f"  │  [1]  Skip unstable steps ({skip_label})  ← Recommended\n"
-        f"  │  [2]  Proceed anyway  (may hang for hours or crash)\n"
-        f"  └{'─' * 70}"
+    skip_label = (
+        f"run only x ≤ {x_safe_max:.4f}"
+        if x_safe_max is not None
+        else "skip all unstable steps"
     )
+
+    message = (
+        f"⚠ WARNING: High Valence Electron Concentration (VEC > {vec_threshold}) "
+        f"detected for x ≥ {x_first_red:.4f} (VEC = {vec_first:.2f}).\n\n"
+        f"VCA pseudo-atoms with VEC > {vec_threshold} exhibit strong electronic "
+        f"instability (Band Jahn-Teller effect). CASTEP will likely fail "
+        f"to converge the SCF cycle or yield C44 < 0 (Born instability).\n\n"
+        f"Affected steps ({len(red_steps)}): "
+        + "  ".join(f"x={v:.4f}" for v in red_steps[:6])
+        + (" …" if len(red_steps) > 6 else "")
+        + "\n\n"
+        f"[1] Skip unstable steps ({skip_label}) ← Recommended\n"
+        f"[2] Proceed anyway (may hang for hours or crash)"
+    )
+
+    print(f"\n{draw_box(message)}")
 
     while True:
         try:
@@ -674,7 +823,11 @@ def ask_vec_guard(
         except EOFError:
             raw = "1"
         if raw in {"", "1"}:
-            skipped_note = f"Only x ≤ {x_safe_max:.4f} will be computed." if x_safe_max is not None else "All planned steps are unstable and will be skipped."
+            skipped_note = (
+                f"Only x ≤ {x_safe_max:.4f} will be computed."
+                if x_safe_max is not None
+                else "All planned steps are unstable and will be skipped."
+            )
             print(
                 f"\n  ✓  Skipping {len(red_steps)} unstable step(s) with VEC > {vec_threshold}.\n"
                 f"     {skipped_note}\n"
@@ -693,6 +846,7 @@ def ask_vec_guard(
 # ─────────────────────────────────────────────────────────────────────────────
 # Elastic step inline display
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def print_elastic_progress(n_strains: int, vec: float, nextra: int) -> None:
     """
@@ -730,27 +884,20 @@ def print_elastic_result(elastic_data: dict, elapsed_s: float) -> None:
         print("  └─ ✗ Elastic step failed.")
         return
 
-    b  = elastic_data.get("B_Hill_GPa",  "—")
-    g  = elastic_data.get("G_Hill_GPa",  "—")
-    e  = elastic_data.get("E_GPa",       "—")
-    c11 = elastic_data.get("C11",        "—")
-    c12 = elastic_data.get("C12",        "—")
-    c44 = elastic_data.get("C44",        "—")
+    b = elastic_data.get("B_Hill_GPa", "—")
+    g = elastic_data.get("G_Hill_GPa", "—")
+    e = elastic_data.get("E_GPa", "—")
+    c11 = elastic_data.get("C11", "—")
+    c12 = elastic_data.get("C12", "—")
+    c44 = elastic_data.get("C44", "—")
     src = elastic_data.get("elastic_source", "CASTEP")
     tag = "  [Vegard]" if "Vegard" in src else ""
-    r2  = elastic_data.get("elastic_R2_min", "")
+    r2 = elastic_data.get("elastic_R2_min", "")
     r2_tag = f"  R²={r2}" if r2 and r2 != "N/A" else ""
     note = elastic_data.get("elastic_quality_note", "")
 
-    print(
-        f"  │  ✓ Elastic Tensors ({t}){tag}"
-        f"  [B={b}  G={g}  E={e} GPa]{r2_tag}"
-    )
-    print(
-        f"  │     C11={c11}  C12={c12}  C44={c44} GPa"
-    )
+    print(f"  │  ✓ Elastic Tensors ({t}){tag}  [B={b}  G={g}  E={e} GPa]{r2_tag}")
+    print(f"  │     C11={c11}  C12={c12}  C44={c44} GPa")
     if note:
         print(f"  │  ⚠  {note}")
     print("  └─ ✓ Elastic step completed.")
-
-
