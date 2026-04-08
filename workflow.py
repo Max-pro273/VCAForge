@@ -281,9 +281,52 @@ def new_run(
 # Dynamic CSV export
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Ordered column layout for scientific CSV output.
+# Fixed fields appear first; dynamic fields (from step.parsed) follow
+# in the order they were first added — but we pre-seed the preferred order
+# via _CSV_PREFERRED_ORDER so elastic / thermal columns appear grouped.
 _CSV_FIXED_FIELDS = [
-    "step", "concentration", "status", "step_dir",
-    "started_at", "finished_at", "rc",
+    "step", "concentration", "status",
+    "started_at", "finished_at",
+    "wall_time_s", "elastic_wall_time_s", "total_wall_time_s",
+]
+
+# Preferred column order for scientific readability.
+# Any key not listed here will appear after these, in insertion order.
+_CSV_PREFERRED_ORDER = [
+    # ── Composition ──────────────────────────────────────────────────────
+    "concentration", "VEC",
+    # ── Structural ───────────────────────────────────────────────────────
+    "a_opt_ang", "b_opt_ang", "c_opt_ang", "volume_ang3", "density_gcm3",
+    # ── Thermodynamic ────────────────────────────────────────────────────
+    "enthalpy_eV", "dH_mix_meV_per_fu",
+    # ── Elastic tensor (full cubic matrix) ───────────────────────────────
+    "C11", "C12", "C44",
+    "C22", "C33", "C13", "C23", "C55", "C66",
+    "C_prime_GPa",
+    # ── Bulk modulus (Voigt / Reuss / Hill) ──────────────────────────────
+    "B_Voigt_GPa", "B_Reuss_GPa", "B_Hill_GPa",
+    # ── Shear modulus ─────────────────────────────────────────────────────
+    "G_Voigt_GPa", "G_Reuss_GPa", "G_Hill_GPa",
+    # ── Young's modulus, Poisson ──────────────────────────────────────────
+    "E_GPa", "nu",
+    # ── Lamé parameters ───────────────────────────────────────────────────
+    "lambda_Lame_GPa", "mu_Lame_GPa",
+    # ── Mechanical indices ────────────────────────────────────────────────
+    "Zener_A", "Pugh_ratio", "Cauchy_pressure_GPa",
+    "Kleinman_zeta", "acoustic_Gruneisen",
+    # ── Hardness ─────────────────────────────────────────────────────────
+    "H_Vickers_GPa",
+    # ── Sound velocities ─────────────────────────────────────────────────
+    "v_longitudinal_ms", "v_transverse_ms", "v_mean_ms",
+    # ── Thermal ───────────────────────────────────────────────────────────
+    "T_Debye_K",
+    # ── Elastic fit quality ───────────────────────────────────────────────
+    "elastic_source", "elastic_n_points", "elastic_R2_min",
+    "elastic_quality_note",
+    # ── Convergence / metadata ────────────────────────────────────────────
+    "geom_converged", "nextra_bands_used", "warnings",
+    "step_dir", "rc",
 ]
 
 
@@ -311,27 +354,45 @@ def write_csv(state: RunState) -> Path:
                     f"{dh_map[step.concentration]:.3f}",
                 )
 
-    # Collect all dynamic field names across all steps (preserving insertion order)
-    dynamic_fields: list[str] = []
-    seen_fields: set[str] = set()
+    # Build column list: fixed header + preferred order + any remaining dynamic
+    all_parsed_keys: set[str] = set()
+    for step in state.steps:
+        all_parsed_keys.update(step.parsed.keys())
+
+    # Start with preferred order (only keys that actually exist in data)
+    ordered: list[str] = []
+    seen: set[str] = set(_CSV_FIXED_FIELDS)
+    for key in _CSV_PREFERRED_ORDER:
+        if key not in seen and (key in all_parsed_keys or key in _CSV_FIXED_FIELDS):
+            ordered.append(key)
+            seen.add(key)
+    # Append any remaining dynamic keys not in preferred order
     for step in state.steps:
         for key in step.parsed:
-            if key not in seen_fields:
-                seen_fields.add(key)
-                dynamic_fields.append(key)
+            if key not in seen:
+                ordered.append(key)
+                seen.add(key)
 
-    all_fields = _CSV_FIXED_FIELDS + dynamic_fields
+    # Remove wall_time_s from fixed if it's already in ordered (avoid dupe)
+    fixed_deduped = [f for f in _CSV_FIXED_FIELDS if f not in seen or f == f]
+    all_fields = _CSV_FIXED_FIELDS + ordered
     out_path = state.proj_dir / "vca_results.csv"
 
     with out_path.open("w", newline="", encoding="utf-8") as csv_file:
-        csv_file.write(f"# vca_tool v{VERSION} — VCA Results\n")
+        csv_file.write(f"# VCAForge v{VERSION} — Elastic Constants & Structural Data\n")
         csv_file.write(f"# System  : {state.species_a}(1-x){state.species_b}(x)\n")
         csv_file.write(f"# Seed    : {state.seed}\n")
         csv_file.write(
             f"# Range   : {state.c_start} → {state.c_end}"
             f"  ({state.n_steps} intervals)\n"
         )
-        csv_file.write(f"# Updated : {_now()}\n#\n")
+        csv_file.write(f"# Updated : {_now()}\n")
+        csv_file.write("# \n")
+        csv_file.write("# Elastic constants: finite-strain OLS fit (Voigt-Reuss-Hill averages)\n")
+        csv_file.write("# Hardness: Chen (2011) model  H_V = 2(k²G)^0.585 - 3  (GPa)\n")
+        csv_file.write("# Debye T:  Anderson (1963) model from VRH sound velocities\n")
+        csv_file.write("# dH_mix:   Vegard deviation (eV/f.u.) — qualitative trend only\n")
+        csv_file.write("# \n")
         writer = csv.DictWriter(
             csv_file, fieldnames=all_fields, extrasaction="ignore", restval="N/A"
         )

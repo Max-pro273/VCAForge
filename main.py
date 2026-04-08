@@ -121,14 +121,13 @@ def _parse_and_validate_args(parser):
             x0 = float(args.range[0])
             x1 = float(args.range[1])
             n_steps = int(args.range[2])
-
-            if not (0.0 <= x0 <= 1.0 and 0.0 <= x1 <= 1.0):
-                parser.error("X0 and X1 must be in [0, 1]")
-            if n_steps < 1:
-                parser.error("N must be ≥ 1")
-            args.range = (x0, x1, n_steps)
         except ValueError:
             parser.error("--range needs two floats and one int: X0 X1 N")
+        if not (0.0 <= x0 <= 1.0 and 0.0 <= x1 <= 1.0):
+            parser.error("X0 and X1 must be in [0, 1]")
+        if n_steps < 1:
+            parser.error("N must be ≥ 1")
+        args.range = (x0, x1, n_steps)
 
     return args
 
@@ -486,14 +485,14 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
         cached = _find_endpoint_elastic(0.0)
         if cached:
             endpoint_elastic["0"] = cached
-            print("  │  x=0.0 Cij found in previous run — using cached data.")
+            print(f"  │  x=0.0 Cij found in previous run — using cached data.")
         else:
             missing_endpoints.append(0.0)
     if not has_x1:
         cached = _find_endpoint_elastic(1.0)
         if cached:
             endpoint_elastic["1"] = cached
-            print("  │  x=1.0 Cij found in previous run — using cached data.")
+            print(f"  │  x=1.0 Cij found in previous run — using cached data.")
         else:
             missing_endpoints.append(1.0)
 
@@ -502,7 +501,7 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
     if missing_endpoints:
         labels = " and ".join(f"x={v:.1f}" for v in missing_endpoints)
         print(f"  ⚠  Vegard interpolation requires pure endpoints ({labels}).")
-        print("     They are missing from the current sweep and all previous runs.")
+        print(f"     They are missing from the current sweep and all previous runs.")
         try:
             ans = input(f"  Compute {labels} now? [Y/n]: ").strip().lower()
         except EOFError:
@@ -540,51 +539,53 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
             )
 
     # Run queued endpoint GeomOpt + elastic first
+    import subprocess as _sp
     import time as _time
-
     for ep_x, ep_dir in endpoint_steps_to_run:
         x_label = f"x={ep_x:.4f}  (endpoint)"
         print(f"\n  ┌─ {x_label}")
         cmd = castep_cmd.replace("{seed}", state.seed)
 
         # GeomOpt with the same progress bar used in the main loop
-        from castep_io import ACTIVE_ENGINE as _AE
         from workflow import _run_castep_process as _rcp
-
+        from castep_io import ACTIVE_ENGINE as _AE
         _castep_out_ep = ep_dir / f"{state.seed}{_AE.output_suffix}"
-        print("  │  ▶ Geometry Optimization …", flush=True)
+        print(f"  │  ▶ Geometry Optimization …", flush=True)
         _t0_geom = _time.monotonic()
         _geom_res = _rcp(cmd, ep_dir, _castep_out_ep)
         _geom_t = ui._fmt_time(_time.monotonic() - _t0_geom)
         if _geom_res.skipped:
-            print("  │  ⊘ GeomOpt skipped")
+            print(f"  │  ⊘ GeomOpt skipped")
         else:
             # Parse a_opt from the .castep output for the result line
             try:
                 from castep_io import parse_castep_log as _pcl
-
                 _ep_res = _pcl(_castep_out_ep)
                 _ep_parsed = _ep_res.to_dict()
-                _a_ep = _ep_parsed.get("a_opt_ang", "—")
-                _h_ep = _ep_parsed.get("enthalpy_eV", "—")
-                print(
-                    f"  │  ▶ Geometry Optimization … ✓  ({_geom_t})  [a={_a_ep}Å  H={_h_ep} eV]"
-                )
+                _a_ep = _ep_parsed.get('a_opt_ang', '—')
+                _h_ep = _ep_parsed.get('enthalpy_eV', '—')
+                print(f"  │  ▶ Geometry Optimization … ✓  ({_geom_t})  [a={_a_ep}Å  H={_h_ep} eV]")
             except Exception:
                 print(f"  │  ▶ Geometry Optimization … ✓  ({_geom_t})")
         # Compute VEC + nextra for the endpoint
         try:
-            from elasticity import nextra_bands_for, vec_for_concentration
-
-            _vec_ep = vec_for_concentration(
-                state.species_a, state.species_b, ep_x, None
-            )
+            from elasticity import vec_for_concentration, nextra_bands_for
+            _vec_ep = vec_for_concentration(state.species_a, state.species_b, ep_x, None)
             _nextra_ep = nextra_bands_for(ep_x, _vec_ep)
             _n_strains_ep = 6  # cubic default
         except Exception:
             _vec_ep, _nextra_ep, _n_strains_ep = 8.0, 10, 6
         ui.print_elastic_progress(_n_strains_ep, _vec_ep, _nextra_ep)
         _t0_ep = _time.monotonic()
+        # Read density + volume from the endpoint GeomOpt output
+        _ep_density, _ep_volume = None, None
+        try:
+            from castep_io import parse_castep_log as _pcl2, ACTIVE_ENGINE as _AE2
+            _ep_parsed2 = _pcl2(ep_dir / f"{state.seed}{_AE2.output_suffix}").to_dict()
+            _ep_density = float(_ep_parsed2.get('density_gcm3', 0) or 0) or None
+            _ep_volume  = float(_ep_parsed2.get('volume_ang3',  0) or 0) or None
+        except Exception:
+            pass
         ep_data = run_finite_strain_elastic(
             seed_dir=ep_dir,
             seed=state.seed,
@@ -594,6 +595,8 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
             species_b=state.species_b,
             keep_all=getattr(args, "keep_all", False),
             progress_callback=None,
+            density_gcm3=_ep_density,
+            volume_ang3=_ep_volume,
         )
         ui.print_elastic_result(ep_data, _time.monotonic() - _t0_ep)
         key = "0" if ep_x < 0.5 else "1"
@@ -616,22 +619,17 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
         # Gather VEC for progress display and adaptive nextra_bands
         _t0_elastic = __import__("time").monotonic()
         try:
-            from castep_io import _NONMETALS as _NM_e
-            from castep_io import read_species as _rs_e
             from elasticity import (
-                generate_strain_steps,
                 nextra_bands_for,
                 vec_for_concentration,
+                generate_strain_steps,
             )
-
+            from castep_io import _NONMETALS as _NM_e, read_species as _rs_e
             _all_sp_e = _rs_e(state.proj_dir.parent / f"{state.seed}.cell")
             _nonmetal_e = next(
-                (
-                    s
-                    for s in _all_sp_e
-                    if s.capitalize() in _NM_e
-                    and s.capitalize() not in {state.species_a, state.species_b}
-                ),
+                (s for s in _all_sp_e
+                 if s.capitalize() in _NM_e
+                 and s.capitalize() not in {state.species_a, state.species_b}),
                 None,
             )
             _vec_e = vec_for_concentration(
@@ -640,13 +638,15 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
             _nextra_e = nextra_bands_for(x, _vec_e)
             # Count strain steps (cubic = 6)
             from elastic_workflow import _parse_lattice_from_cell as _plc
-
             _lv = _plc(step_dir / f"{state.seed}.cell")
             _n_strains = len(generate_strain_steps(_lv)) if _lv is not None else 6
         except Exception:
             _vec_e, _nextra_e, _n_strains, _nonmetal_e = 8.0, 15, 6, None
         ui.print_elastic_progress(_n_strains, _vec_e, _nextra_e)
 
+        # Pass density + volume so Debye T and sound velocities are computed
+        _density_e  = float(step.parsed.get('density_gcm3', 0) or 0) or None
+        _volume_e   = float(step.parsed.get('volume_ang3',  0) or 0) or None
         ep_data = run_finite_strain_elastic(
             seed_dir=step_dir,
             seed=state.seed,
@@ -656,18 +656,21 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
             species_b=state.species_b,
             nonmetal=_nonmetal_e,
             keep_all=getattr(args, "keep_all", False),
-            progress_callback=None,  # silence internal logs; ui handles display
+            progress_callback=None,
+            density_gcm3=_density_e,
+            volume_ang3=_volume_e,
         )
-        ui.print_elastic_result(ep_data, __import__("time").monotonic() - _t0_elastic)
+        _t_elastic_wall = __import__("time").monotonic() - _t0_elastic
+        ui.print_elastic_result(ep_data, _t_elastic_wall)
 
         is_failed = not ep_data or "_elastic_error" in ep_data or "C11" not in ep_data
         elastic_results[x] = ep_data if not is_failed else {}
 
         # Result already printed by ui.print_elastic_result inside the new_run_block
         if not is_failed:
-            pass  # success already displayed
+            pass   # success already displayed
         else:
-            pass  # failure already displayed
+            pass   # failure already displayed
 
     # ── Collect endpoint Cij for interpolation ────────────────────────────────
     # Priority: this sweep's own results > cached from previous run > endpoint runs
@@ -694,6 +697,30 @@ def _run_elastic_workflow(state: RunState, args: object) -> None:
 
         if data and "C11" in data:
             step.parsed.update(data)
+            # Inject VEC for this concentration
+            try:
+                from elasticity import vec_for_concentration as _vfc
+                from castep_io import _NONMETALS as _NM_csv, read_species as _rs_csv
+                _sp_csv = _rs_csv(state.proj_dir.parent / f"{state.seed}.cell")
+                _nm_csv = next(
+                    (s for s in _sp_csv
+                     if s.capitalize() in _NM_csv
+                     and s.capitalize() not in {state.species_a, state.species_b}),
+                    None,
+                )
+                step.parsed.setdefault(
+                    'VEC', f"{_vfc(state.species_a, state.species_b, x, _nm_csv):.4f}"
+                )
+            except Exception:
+                pass
+            # Compute total wall time (GeomOpt + Elastic)
+            try:
+                _geom_t  = float(step.parsed.get('wall_time_s', 0) or 0)
+                _elast_t = float(data.get('elastic_wall_time_s', 0) or 0)
+                if _geom_t > 0 or _elast_t > 0:
+                    step.parsed['total_wall_time_s'] = f"{_geom_t + _elast_t:.0f}"
+            except Exception:
+                pass
             continue
 
         if 1e-5 < x < 1.0 - 1e-5 and have_endpoints:
@@ -792,8 +819,7 @@ def main() -> None:
 
                 all_species = _read_sp(cell_path)
                 nonmetals_in_cell = [
-                    s
-                    for s in all_species
+                    s for s in all_species
                     if s.capitalize() in _NM
                     and s.capitalize() not in {species_a, species_b}
                 ]
@@ -802,7 +828,6 @@ def main() -> None:
 
                 if nonmetal and n_steps > 1:
                     import numpy as _np
-
                     planned_x = list(
                         _np.linspace(c_start, c_end, n_steps)
                         if n_steps > 1
@@ -816,17 +841,14 @@ def main() -> None:
 
                     # Guard: ask user about dangerous steps (VEC > 8.4)
                     filtered = ui.ask_vec_guard(
-                        species_a,
-                        species_b,
-                        planned_x,
-                        nonmetal,
+                        species_a, species_b, planned_x, nonmetal,
                         vec_threshold=8.4,
                     )
                     if filtered is not None and len(filtered) < len(planned_x):
                         # User chose to skip red-zone steps.
                         # Recompute n_steps / c_end to the filtered range.
                         if filtered:
-                            c_end = max(filtered)
+                            c_end   = max(filtered)
                             n_steps = len(filtered)
                         else:
                             print("  ⚠  All steps would be skipped. Exiting.")

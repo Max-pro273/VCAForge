@@ -187,6 +187,70 @@ class StrainStep:
         return f"_cij__{self.pattern_idx}__{self.step_idx}"
 
 
+
+
+def standardize_cubic_cell(lattice_vecs: np.ndarray) -> np.ndarray:
+    """
+    Convert a non-orthogonal (primitive) cubic cell to an orthogonal
+    conventional form before generating finite-difference strain patterns.
+
+    Why this is required
+    ────────────────────
+    cif2cell and CASTEP output primitive FCC/BCC cells with non-orthogonal
+    lattice vectors (e.g. TiC FCC: a=[2.165, 2.165, 0], b=[2.165, 0, 2.165]).
+    When a Voigt strain e1+e4 is applied to these axes, the physical
+    deformation is NOT aligned with [100]/[010]/[001] — it is rotated by 45°.
+    The stress tensor returned by CASTEP is in the Cartesian lab frame, so
+    the regression C11=∂σ₁₁/∂ε₁₁ uses incompatible axes → negative C11.
+
+    Solution: before generating strain patterns, transform to an equivalent
+    orthogonal description.  For cubic symmetry this means:
+      a_conv = a_prim * sqrt(2)   (for FCC primitive → conventional)
+    and use a_conv * I₃ as the lattice for strain generation.
+
+    The CASTEP SinglePoint cells use the ACTUAL (strained) primitive lattice
+    (via apply_strain_to_cell which modifies LATTICE_CART) — so the stress
+    output is still in the correct physical frame.  Only the STRAIN MAGNITUDE
+    computation in generate_strain_steps uses this orthogonal reference.
+
+    Detection: if all three vector lengths are equal AND all pairwise dot
+    products are equal and non-zero → FCC or BCC primitive cell.
+    """
+    a_len = np.linalg.norm(lattice_vecs[0])
+    b_len = np.linalg.norm(lattice_vecs[1])
+    c_len = np.linalg.norm(lattice_vecs[2])
+
+    # All vectors equal length?
+    if not (abs(a_len - b_len) < 1e-4 and abs(a_len - c_len) < 1e-4):
+        return lattice_vecs  # not a simple cubic-type primitive cell
+
+    # All pairwise dot products equal? (FCC: cos(60°)=0.5, BCC: cos(109.47°)=-1/3)
+    dot_ab = float(np.dot(lattice_vecs[0], lattice_vecs[1]))
+    dot_ac = float(np.dot(lattice_vecs[0], lattice_vecs[2]))
+    dot_bc = float(np.dot(lattice_vecs[1], lattice_vecs[2]))
+    dots_equal = abs(dot_ab - dot_ac) < 1e-4 and abs(dot_ab - dot_bc) < 1e-4
+
+    if not dots_equal or abs(dot_ab) < 1e-4:
+        return lattice_vecs  # already orthogonal or not a known type
+
+    cos_angle = dot_ab / (a_len * a_len)
+
+    # FCC primitive: cos(60°) = 0.5  → a_conv = a_prim * sqrt(2)
+    if abs(cos_angle - 0.5) < 0.02:
+        a_conv = a_len * np.sqrt(2.0)
+        return np.array([[a_conv, 0.0, 0.0],
+                         [0.0, a_conv, 0.0],
+                         [0.0, 0.0, a_conv]])
+
+    # BCC primitive: cos(109.47°) ≈ -1/3  → a_conv = a_prim * 2/sqrt(3)
+    if abs(cos_angle + 1.0 / 3.0) < 0.02:
+        a_conv = a_len * 2.0 / np.sqrt(3.0)
+        return np.array([[a_conv, 0.0, 0.0],
+                         [0.0, a_conv, 0.0],
+                         [0.0, 0.0, a_conv]])
+
+    return lattice_vecs  # unknown primitive type — return as-is
+
 def generate_strain_steps(
     lattice_vecs: np.ndarray,     # shape (3, 3), rows = vectors in Å
     lattice_code: int = 5,
@@ -418,12 +482,52 @@ def read_stress(castep_path: Path) -> np.ndarray | None:
 # Cubic derived properties (Voigt-Reuss-Hill)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def cubic_derived(c11: float, c12: float, c44: float) -> dict[str, float]:
+def cubic_derived(
+    c11: float,
+    c12: float,
+    c44: float,
+    density_gcm3: float | None = None,
+    mean_atomic_mass_amu: float | None = None,
+    n_atoms_per_cell: int | None = None,
+    volume_ang3: float | None = None,
+) -> dict[str, float]:
     """
-    Polycrystalline elastic properties from cubic Cij.
+    Full set of polycrystalline elastic properties for a cubic crystal.
 
     Born stability for cubic: C11 > 0, C44 > 0, C11 > |C12|, C11 + 2*C12 > 0.
-    Returns empty dict if the crystal is mechanically unstable.
+    Returns empty dict if mechanically unstable.
+
+    Extended properties (require density / mass / volume):
+    ──────────────────────────────────────────────────────
+    T_Debye_K           Debye temperature (Anderson 1963):
+                          θ_D = (h/k_B) * (3n N_A ρ / 4π M)^(1/3) * v_D
+                        where v_D = [(1/3)(2/v_s³ + 1/v_l³)]^(-1/3)
+                        v_l = sqrt((B + 4G/3) / ρ)  (longitudinal)
+                        v_s = sqrt(G / ρ)            (transverse/shear)
+
+    v_longitudinal_ms   Longitudinal sound velocity (m/s)
+    v_transverse_ms     Transverse (shear) sound velocity (m/s)
+    v_mean_ms           Mean sound velocity (m/s)
+
+    H_Vickers_GPa       Vickers hardness.  Two models:
+                        • Chen 2011:  H = 2(K²G)^0.585 − 3  (K = G/B)
+                        • Tian 2012:  H = 0.92·k^1.137·G^0.708
+                          where k = G/B (Pugh ratio)
+                        Chen model used as primary (better for carbides).
+
+    lambda_Lame_GPa     First Lamé parameter λ = B - 2G/3
+    mu_Lame_GPa         Second Lamé parameter μ = G (= shear modulus)
+
+    Kleinman_param      Kleinman internal strain parameter ζ (cubic):
+                          ζ = (C11 + 8C12) / (7C11 + 2C12)
+                        ζ→0: bond bending dominates; ζ→1: bond stretching.
+
+    C_prime_GPa         Shear constant C' = (C11 - C12) / 2
+                        (resistance to tetragonal shear distortion)
+
+    acoustic_Gruneisen  Acoustic Grüneisen parameter γ_a:
+                          γ_a = (3/2)(1 + ν) / (2 - 3ν)
+                        Relates thermal expansion to elastic properties.
     """
     if c11 <= 0 or c44 <= 0:
         return {}
@@ -432,32 +536,93 @@ def cubic_derived(c11: float, c12: float, c44: float) -> dict[str, float]:
     if c11 + 2 * c12 <= 0:
         return {}
 
+    # ── Voigt-Reuss-Hill averages ─────────────────────────────────────────────
     b_v = (c11 + 2 * c12) / 3.0
     g_v = (c11 - c12 + 3 * c44) / 5.0
 
     denom = (c11 + 2 * c12) * (c11 - c12)
-    s11 =  (c11 + c12) / denom
-    s12 =  -c12 / denom
-    s44 =  1.0 / c44
+    s11 = (c11 + c12) / denom
+    s12 = -c12 / denom
+    s44 = 1.0 / c44
 
     b_r = 1.0 / (3 * (s11 + 2 * s12))
     g_r = 5.0 / (4 * (s11 - s12) + 3 * s44)
 
-    b_h = (b_v + b_r) / 2
-    g_h = (g_v + g_r) / 2
-    e_h = 9 * b_h * g_h / (3 * b_h + g_h)
-    nu  = (3 * b_h - 2 * g_h) / (2 * (3 * b_h + g_h))
+    b_h = (b_v + b_r) / 2.0
+    g_h = (g_v + g_r) / 2.0
+    e_h = 9.0 * b_h * g_h / (3.0 * b_h + g_h)
+    nu  = (3.0 * b_h - 2.0 * g_h) / (2.0 * (3.0 * b_h + g_h))
 
-    return {
+    # ── Derived elastic indices ───────────────────────────────────────────────
+    zener_a   = 2.0 * c44 / (c11 - c12)
+    pugh      = g_h / b_h                     # G/B: >0.57 brittle, <0.57 ductile
+    cauchy    = c12 - c44                     # >0 metallic bonding, <0 covalent
+    c_prime   = (c11 - c12) / 2.0            # tetragonal shear modulus
+    kleinman  = (c11 + 8.0 * c12) / (7.0 * c11 + 2.0 * c12)
+    lame_lam  = b_h - 2.0 * g_h / 3.0       # first Lamé λ
+    # acoustic Grüneisen (Slater formula)
+    gamma_a   = (3.0 / 2.0) * (1.0 + nu) / (2.0 - 3.0 * nu)
+
+    props: dict[str, float] = {
+        # ── Full Cij matrix (cubic: C11=C22=C33, C12=C13=C23, C44=C55=C66) ──
         "C11": c11, "C12": c12, "C44": c44,
-        "B_Voigt_GPa": b_v, "B_Reuss_GPa": b_r, "B_Hill_GPa": b_h,
-        "G_Voigt_GPa": g_v, "G_Reuss_GPa": g_r, "G_Hill_GPa": g_h,
-        "E_GPa":   e_h,
-        "nu":      nu,
-        "Zener_A": 2 * c44 / (c11 - c12),
-        "Pugh_ratio": g_h / b_h,
-        "Cauchy_pressure_GPa": c12 - c44,
+        "C22": c11, "C33": c11,   # cubic symmetry
+        "C13": c12, "C23": c12,
+        "C55": c44, "C66": c44,
+        # ── Bulk modulus (Voigt / Reuss / Hill) ───────────────────────────────
+        "B_Voigt_GPa": b_v,
+        "B_Reuss_GPa": b_r,
+        "B_Hill_GPa":  b_h,
+        # ── Shear modulus ─────────────────────────────────────────────────────
+        "G_Voigt_GPa": g_v,
+        "G_Reuss_GPa": g_r,
+        "G_Hill_GPa":  g_h,
+        # ── Young's modulus, Poisson ──────────────────────────────────────────
+        "E_GPa": e_h,
+        "nu":    nu,
+        # ── Elastic indices ───────────────────────────────────────────────────
+        "Zener_A":             zener_a,
+        "Pugh_ratio":          pugh,
+        "Cauchy_pressure_GPa": cauchy,
+        "C_prime_GPa":         c_prime,
+        "Kleinman_zeta":       kleinman,
+        "lambda_Lame_GPa":     lame_lam,
+        "mu_Lame_GPa":         g_h,         # μ = G by definition
+        "acoustic_Gruneisen":  gamma_a,
+        # ── Vickers hardness (Chen 2011) ──────────────────────────────────────
+        # H_V = 2(k²G)^0.585 − 3,  k = G/B
+        "H_Vickers_GPa": max(0.0, 2.0 * (pugh**2 * g_h)**0.585 - 3.0),
     }
+
+    # ── Properties requiring density ─────────────────────────────────────────
+    if density_gcm3 is not None and density_gcm3 > 0:
+        rho = density_gcm3 * 1e3          # kg/m³
+
+        # GPa → Pa
+        b_pa = b_h * 1e9
+        g_pa = g_h * 1e9
+
+        v_l  = (( b_pa + 4.0 * g_pa / 3.0) / rho) ** 0.5   # m/s longitudinal
+        v_s  = (g_pa / rho) ** 0.5                           # m/s transverse
+        # Mean velocity (Anderson 1963): v_D^-3 = (1/3)(2/v_s³ + 1/v_l³)
+        v_m  = (1.0 / 3.0 * (2.0 / v_s**3 + 1.0 / v_l**3)) ** (-1.0 / 3.0)
+
+        props["v_longitudinal_ms"] = v_l
+        props["v_transverse_ms"]   = v_s
+        props["v_mean_ms"]         = v_m
+
+        # Debye temperature: θ_D = (ℏ/k_B) * v_D * (6π²n)^(1/3)
+        # n = number of atoms per unit volume
+        if n_atoms_per_cell is not None and volume_ang3 is not None and volume_ang3 > 0:
+            import scipy.constants as _sc
+        # Use values directly to avoid scipy dependency
+            hbar  = 1.054571817e-34   # J·s
+            k_B   = 1.380649e-23      # J/K
+            n_vol = n_atoms_per_cell / (volume_ang3 * 1e-30)  # atoms/m³
+            theta_D = (hbar / k_B) * v_m * (6.0 * 3.14159265 ** 2 * n_vol) ** (1.0 / 3.0)
+            props["T_Debye_K"] = theta_D
+
+    return props
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -468,28 +633,28 @@ def fit_cij_from_stress(
     stress_list: list[np.ndarray],
     strain_list: list[np.ndarray],
     lattice_code: int = 5,
+    density_gcm3: float | None = None,
+    mean_atomic_mass_amu: float | None = None,
+    n_atoms_per_cell: int | None = None,
+    volume_ang3: float | None = None,
 ) -> dict[str, Any]:
     """
     Fit elastic constants from stress vs strain data.
 
     Parameters
     ──────────
-    stress_list   List of Voigt stress vectors [s11,s22,s33,s23,s13,s12] (GPa).
-    strain_list   Corresponding Voigt strain vectors [e11,e22,e33,2e23,2e13,2e12].
-    lattice_code  Crystal symmetry (5 = cubic only currently supported).
+    stress_list           Voigt stress vectors [s11,s22,s33,s23,s13,s12] (GPa).
+    strain_list           Corresponding Voigt strain vectors.
+    lattice_code          Crystal symmetry (5 = cubic only currently supported).
+    density_gcm3          Crystal density — enables sound velocities + Debye T.
+    mean_atomic_mass_amu  Mean atomic mass per atom (for Debye).
+    n_atoms_per_cell      Atoms in the unit cell (for Debye).
+    volume_ang3           Cell volume in Å³ (for Debye).
 
     Returns
     ───────
-    dict with str keys formatted to 4 decimal places:
-      C11, C12, C44, B_Hill_GPa, G_Hill_GPa, E_GPa, nu, ...
+    dict with str keys formatted to 4 decimal places.
     OR {"error": "<message>"} on failure — no exceptions propagate.
-
-    OLS with intercept
-    ──────────────────
-    σ = C·ε + σ₀  (σ₀ is residual stress after GeomOpt, should be small).
-    Using the intercept gives the correct slope regardless of σ₀, and
-    gives a meaningful R² = 1 - SS_res/SS_tot instead of the R²→0 that
-    a through-origin fit produces when σ₀ ≠ 0.
     """
     if lattice_code != 5:
         return {"error": f"lattice code {lattice_code}: only cubic (5) implemented"}
@@ -530,7 +695,13 @@ def fit_cij_from_stress(
 
     r2_min = min(r2_c11, r2_c12, r2_c44)
 
-    props = cubic_derived(c11, c12, c44)
+    props = cubic_derived(
+        c11, c12, c44,
+        density_gcm3=density_gcm3,
+        mean_atomic_mass_amu=mean_atomic_mass_amu,
+        n_atoms_per_cell=n_atoms_per_cell,
+        volume_ang3=volume_ang3,
+    )
     if not props:
         return {
             "error": (

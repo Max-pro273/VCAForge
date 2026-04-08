@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from castep_io import atom_count
 from elasticity import (
     apply_strain_to_cell,
     fit_cij_from_stress,
@@ -38,6 +39,7 @@ from elasticity import (
     nextra_bands_for,
     pointgroup_to_lattice_code,
     read_stress,
+    standardize_cubic_cell,
     vec_for_concentration,
     write_cijdat,
 )
@@ -222,6 +224,7 @@ def _build_strained_param(
     text = _set(text, "opt_strategy", "speed")
     text = _set(text, "write_checkpoint", "none")
     text = _set(text, "num_dump_cycles", "0")
+    text = _set(text, "write_cell_structure", "false")  # suppress -out.cell
 
     for kw in _GEOM_KEYS:
         text = _re.sub(rf"^\s*{kw}\s*:.*$\n?", "", text, flags=_re.M | _re.I)
@@ -249,6 +252,8 @@ def run_finite_strain_elastic(
     n_steps: int = 3,
     keep_all: bool = False,
     progress_callback: Callable[[str], None] | None = None,
+    density_gcm3: float | None = None,
+    volume_ang3: float | None = None,
 ) -> dict[str, Any]:
     """
     Run the full finite-strain elastic constants workflow for one seed.
@@ -308,8 +313,13 @@ def run_finite_strain_elastic(
     lattice_code = _parse_lattice_code_from_castep(castep_out) or 5  # default cubic
 
     # ── Generate strain steps (pure Python) ──────────────────────────────────
+    # CRITICAL: standardize primitive FCC/BCC cells to orthogonal form
+    # before computing strain magnitudes.  Primitive cells (e.g. from cif2cell)
+    # have non-orthogonal vectors — straining them along Voigt axes gives
+    # physically wrong stress-strain relationships → garbage Cij values.
+    lattice_vecs_orth = standardize_cubic_cell(lattice_vecs)
     strain_steps = generate_strain_steps(
-        lattice_vecs=lattice_vecs,
+        lattice_vecs=lattice_vecs_orth,
         lattice_code=lattice_code,
         max_strain=strain,
         n_steps=n_steps,
@@ -384,6 +394,9 @@ def run_finite_strain_elastic(
             "_elastic_error": f"only {n_ok}/{len(strained_seeds)} CASTEP runs succeeded"
         }
 
+    # Read n_atoms from the GeomOpt .castep (not strained) for Debye calculation
+    n_atoms = atom_count(castep_out)
+
     # ── Collect stress / strain pairs ─────────────────────────────────────────
     stresses: list[np.ndarray] = []
     strains: list[np.ndarray] = []
@@ -406,24 +419,40 @@ def run_finite_strain_elastic(
         )
 
     # ── Fit Cij ───────────────────────────────────────────────────────────────
-    elastic_data = fit_cij_from_stress(stresses, strains, lattice_code)
+    elastic_data = fit_cij_from_stress(
+        stresses,
+        strains,
+        lattice_code,
+        density_gcm3=density_gcm3,
+        n_atoms_per_cell=n_atoms if n_atoms > 0 else None,
+        volume_ang3=volume_ang3,
+    )
 
     if "error" in elastic_data:
         return {"_elastic_error": elastic_data["error"]}
 
-    # ── Post-fit cleanup: remove strained cell/param files ───────────────────
+    # ── Post-fit cleanup: remove ALL intermediate elastic files ─────────────
+    # Kept after fitting (diagnostics):  <seed>.cijdat, <seed>_cij__*.castep
+    # Removed always:  strained .cell, .param, -out.cell, _strain_src.cell
+    # Removed unless --keep-all:  *.geom (trajectory)
     if not keep_all:
         for ss in strained_seeds:
-            for ext in (".cell", ".param"):
+            for ext in (".cell", ".param", "-out.cell"):
                 try:
                     (seed_dir / f"{ss}{ext}").unlink(missing_ok=True)
                 except OSError:
                     pass
-        # strain_src cell also not needed after fitting
+        # strain_src cell — internal working copy, not needed after fitting
         try:
             base_cell.unlink(missing_ok=True)
         except OSError:
             pass
+        # .geom files written by CASTEP SinglePoint (not useful for stress calc)
+        for f in seed_dir.glob("*.geom"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
     t_elapsed = time.monotonic() - t_start
     elastic_data["elastic_wall_time_s"] = f"{t_elapsed:.0f}"
