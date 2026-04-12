@@ -522,31 +522,27 @@ def wizard_castep_cmd(override: str | None) -> str:
 # Draw box
 # ─────────────────────────────────────────────────────────────────────────────
 
-import textwrap
 
-
-def draw_box(text: str, width: int = 74, padding: int = 2) -> str:
+def draw_box(lines: list[str], min_width: int = 70, padding: int = 2) -> str:
     """
     Draw an ASCII box around multiline text, wrapping long lines automatically.
     Maintains the UI style of vca_tool.
     """
-    inner_width = width - (padding * 2) - 2
-    out_lines = [f"  ┌{'─' * (width - 2)}┐"]
+    max_line_len = max(len(line) for line in lines) if lines else 0
+    inner_width = max(min_width, max_line_len + (padding * 2))
 
-    for paragraph in text.splitlines():
-        if not paragraph.strip():
-            # Preserve empty lines
-            out_lines.append(f"  │{' ' * (width - 2)}│")
-            continue
+    top_border = f"  ┌{'─' * inner_width}┐\n"
+    bottom_border = f"  └{'─' * inner_width}┘"
 
-        # Wrap long paragraphs safely
-        wrapped = textwrap.wrap(paragraph, width=inner_width)
-        for line in wrapped:
-            # Left-align the text, pad the right side with spaces
-            out_lines.append(f"  │{' ' * padding}{line:<{inner_width}}{' ' * padding}│")
+    # Wrap long paragraphs safely
+    box = [top_border]
+    for line in lines:
+        # Left-align the text, pad the right side with spaces
+        padded_line = f"{' ' * padding}{line}"
+        box.append(f"  │{padded_line:<{inner_width}}│\n")
+    box.append(bottom_border)
 
-    out_lines.append(f"  └{'─' * (width - 2)}┘")
-    return "\n".join(out_lines)
+    return "".join(box)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -801,21 +797,28 @@ def ask_vec_guard(
         else "skip all unstable steps"
     )
 
-    message = (
-        f"⚠ WARNING: High Valence Electron Concentration (VEC > {vec_threshold}) "
-        f"detected for x ≥ {x_first_red:.4f} (VEC = {vec_first:.2f}).\n\n"
-        f"VCA pseudo-atoms with VEC > {vec_threshold} exhibit strong electronic "
-        f"instability (Band Jahn-Teller effect). CASTEP will likely fail "
-        f"to converge the SCF cycle or yield C44 < 0 (Born instability).\n\n"
-        f"Affected steps ({len(red_steps)}): "
-        + "  ".join(f"x={v:.4f}" for v in red_steps[:6])
-        + (" …" if len(red_steps) > 6 else "")
-        + "\n\n"
-        f"[1] Skip unstable steps ({skip_label}) ← Recommended\n"
-        f"[2] Proceed anyway (may hang for hours or crash)"
-    )
+    # Формуємо рядок з кроками
+    affected_steps_str = "  ".join(f"x={v:.4f}" for v in red_steps[:6])
+    if len(red_steps) > 6:
+        affected_steps_str += "  …"
 
-    print(f"\n{draw_box(message)}")
+    # Передаємо текст як список рядків БЕЗ символів рамки
+    warning_lines = [
+        f"⚠  WARNING: High Valence Electron Concentration (VEC > {vec_threshold})",
+        f"   detected for x ≥ {x_first_red:.4f}  (VEC = {vec_first:.2f}).",
+        "",
+        f"VCA pseudo-atoms with VEC > {vec_threshold} exhibit strong electronic",
+        "instability (Band Jahn-Teller effect).  CASTEP will likely fail",
+        "to converge the SCF cycle or yield C44 < 0 (Born instability).",
+        "",
+        f"Affected steps ({len(red_steps)}):  {affected_steps_str}",
+        "",
+        f"[1]  Skip unstable steps ({skip_label})  ← Recommended",
+        "[2]  Proceed anyway  (may hang for hours or crash)",
+    ]
+
+    # Викликаємо функцію малювання та друкуємо
+    print(f"\n{draw_box(warning_lines, min_width=70)}")
 
     while True:
         try:
