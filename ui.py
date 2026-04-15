@@ -32,14 +32,20 @@ from typing import Any
 import config
 import core_physics as phys
 from orchestrator import (
-    DONE, FAILED, PENDING, SKIPPED,
-    ExecResult, RunState, Step, mixing_enthalpy,
+    DONE,
+    FAILED,
+    PENDING,
+    SKIPPED,
+    ExecResult,
+    RunState,
+    Step,
+    mixing_enthalpy,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public dataclass: wizard result
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class WizardResult:
@@ -58,18 +64,19 @@ class WizardResult:
     """
 
     template_element: str
-    target_mix:       dict[str, float]
-    single_mode:      bool
-    c_start:          float
-    c_end:            float
-    n_steps:          int
-    nonmetal:         str
-    run_elastic:      bool
+    target_mix: dict[str, float]
+    single_mode: bool
+    c_start: float
+    c_end: float
+    n_steps: int
+    nonmetal: str
+    run_elastic: bool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Terminal helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _tw(fallback: int = 88) -> int:
     """Return the terminal width, capped at 120 columns."""
@@ -81,7 +88,7 @@ def _tw(fallback: int = 88) -> int:
 
 def _section(title: str) -> None:
     """Print a  ── Title ──────────  section divider at terminal width."""
-    w     = _tw()
+    w = _tw()
     inner = f"── {title} "
     print(f"\n{inner}{'─' * max(2, w - len(inner))}")
 
@@ -95,6 +102,7 @@ def _fmt_time(s: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-level input helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def ask_yes_no(question: str, default: bool | None = None) -> bool:
     """Prompt for a yes/no answer and return a bool.
@@ -165,14 +173,24 @@ def ask_choice(options: list[str], default: str) -> str:
 # .param wizard
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TASKS_VCA  = [
-    "GeometryOptimization", "SinglePoint",
-    "MolecularDynamics", "BandStructure", "Optics",
+_TASKS_VCA = [
+    "GeometryOptimization",
+    "SinglePoint",
+    "MolecularDynamics",
+    "BandStructure",
+    "Optics",
 ]
 _TASKS_FULL = _TASKS_VCA + ["ElasticConstants", "Phonon"]
-_XC_LIST    = [
-    "PBE", "PBEsol", "WC", "PW91", "RPBE",
-    "LDA", "RSCAN", "PBE0", "HSE06",
+_XC_LIST = [
+    "PBE",
+    "PBEsol",
+    "WC",
+    "PW91",
+    "RPBE",
+    "LDA",
+    "RSCAN",
+    "PBE0",
+    "HSE06",
 ]
 
 
@@ -185,8 +203,10 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
         is_vca:       ``True`` for a VCA sweep run.
     """
     from castep.castep import (
-        inject_ncp, smart_defaults,
-        write_geomopt_param, write_singlepoint_param,
+        inject_ncp,
+        smart_defaults,
+        write_geomopt_param,
+        write_singlepoint_param,
     )
 
     param_path = cell_path.with_suffix(".param")
@@ -200,40 +220,45 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     print("  Press Enter to accept the default shown in [brackets].\n")
 
     # 1 / 5  Task
-    tasks     = _TASKS_VCA if is_vca else _TASKS_FULL
+    tasks = _TASKS_VCA if is_vca else _TASKS_FULL
     task_hint = "\n".join(
         f"  │    {t}{'  <- default' if t == 'GeometryOptimization' else ''}"
         for t in tasks
     )
-    vca_note  = (
+    vca_note = (
         "\n  │\n"
         "  │  · ElasticConstants / Phonon are disabled for VCA sweeps.\n"
         "  │    Use the integrated elastic workflow (prompted below)."
-        if is_vca else ""
+        if is_vca
+        else ""
     )
     print(f"  ┌ 1/5  Task\n{task_hint}{vca_note}")
-    task      = ask_choice(tasks, "GeometryOptimization")
+    task = ask_choice(tasks, "GeometryOptimization")
     needs_ncp = task in {"ElasticConstants", "Phonon"}
     if needs_ncp:
-        print(textwrap.dedent(f"""
+        print(
+            textwrap.dedent(f"""
           ⚠  {task} requires norm-conserving pseudopotentials (NCP).
              Ultrasoft PSP will crash: 'strain field response not implemented'.
              The wizard will inject SPECIES_POT NCP into your .cell.
              Recommended cutoff: >= 900 eV for hard elements (C, N, O).
-        """))
+        """)
+        )
 
     # 2 / 5  XC functional
-    print(textwrap.dedent("""
+    print(
+        textwrap.dedent("""
       ┌ 2/5  XC Functional
       │    PBE    — standard for metals and alloys              <- default
       │    PBEsol — better lattice constants for carbides/nitrides
       │    WC     — Wu-Cohen, accurate lattice constants
       │    RSCAN  — best non-hybrid meta-GGA accuracy
-      │    PBE0 / HSE06 — hybrid, 10-100x slower (avoid for VCA sweeps)"""))
+      │    PBE0 / HSE06 — hybrid, 10-100x slower (avoid for VCA sweeps)""")
+    )
     xc = ask_choice(_XC_LIST, "PBE")
 
     # 3 / 5  Cut-off energy
-    rec  = defs["cut_off_energy"]
+    rec = defs["cut_off_energy"]
     hard = defs["hard_detected"]
     if needs_ncp and hard:
         rec = max(rec, 900)
@@ -242,8 +267,8 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     hard_note = (
         f"  │  ⚠  Hard elements detected: {hard}\n"
         "  │     Minimum 700 eV (USP) / 900 eV (NCP) for C, N, O, F, B, H."
-        if hard else
-        "  │    500 eV — metals/alloys (USP)\n"
+        if hard
+        else "  │    500 eV — metals/alloys (USP)\n"
         "  │    700 eV — hard elements (USP, mandatory for C/N/O)"
     )
     print(f"\n  ┌ 3/5  Cut-off energy (eV)\n{hard_note}")
@@ -254,16 +279,18 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
         cutoff = rec
 
     # 4 / 5  Spin polarisation
-    mag  = defs["magnetic_detected"]
+    mag = defs["magnetic_detected"]
     spin = defs["spin_polarized"]
     mag_note = (
         f"  │  ⚠  Magnetic elements detected: {mag}\n"
         "  │     spin_polarized : true is mandatory."
-        if mag else
-        "  │    No magnetic elements detected.  false is safe and ~2x faster."
+        if mag
+        else "  │    No magnetic elements detected.  false is safe and ~2x faster."
     )
     print(f"\n  ┌ 4/5  Spin polarisation\n{mag_note}")
-    print(f"  │    Detected {species_list}.  Recommended: {'true' if spin else 'false'}.")
+    print(
+        f"  │    Detected {species_list}.  Recommended: {'true' if spin else 'false'}."
+    )
     spin = ask_choice(["true", "false"], "true" if spin else "false") == "true"
 
     # 5 / 5  Smearing width
@@ -271,10 +298,12 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     smear_note = (
         "  │    VCA:    0.20 eV — fractional nuclear charge broadens bands.\n"
         "  │    Sharper values often diverge for intermediate x."
-        if is_vca else
-        "  │    Single compound:  0.10 eV — sharp Fermi edge."
+        if is_vca
+        else "  │    Single compound:  0.10 eV — sharp Fermi edge."
     )
-    print(f"\n  ┌ 5/5  Smearing width (eV)\n  │    Electronic temperature for metals_method: dm.")
+    print(
+        "\n  ┌ 5/5  Smearing width (eV)\n  │    Electronic temperature for metals_method: dm."
+    )
     print(smear_note)
     raw = ask_str(f"  Smearing [{default_sw:.2f}]: ", f"{default_sw:.2f}")
     try:
@@ -292,11 +321,15 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
     print()
 
     if task in {"GeometryOptimization", "FiniteStrainElastic"}:
-        write_geomopt_param(param_path, xc, cutoff, spin, nextra, smearing, ncp=needs_ncp)
+        write_geomopt_param(
+            param_path, xc, cutoff, spin, nextra, smearing, ncp=needs_ncp
+        )
     elif task == "SinglePoint":
         write_singlepoint_param(param_path, xc, cutoff, spin, nextra, ncp=needs_ncp)
     else:
-        write_geomopt_param(param_path, xc, cutoff, spin, nextra, smearing, ncp=needs_ncp)
+        write_geomopt_param(
+            param_path, xc, cutoff, spin, nextra, smearing, ncp=needs_ncp
+        )
 
     print(f"  ✓ Written: {param_path.name}")
     return param_path
@@ -305,6 +338,7 @@ def wizard_param(cell_path: Path, species_list: list[str], is_vca: bool) -> Path
 # ─────────────────────────────────────────────────────────────────────────────
 # New composite species / mode wizard  (Block 2 of the spec)
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def wizard_mode(
     cell_path: Path,
@@ -335,19 +369,21 @@ def wizard_mode(
     from castep import config as _ccfg
     from castep.castep import read_species
 
-    found    = read_species(cell_path)
+    found = read_species(cell_path)
     nonmetal = next((s for s in found if s.capitalize() in _ccfg.NONMETALS), "")
-    metals   = [s for s in found if s.capitalize() not in _ccfg.NONMETALS]
+    metals = [s for s in found if s.capitalize() not in _ccfg.NONMETALS]
     template = metals[0] if metals else (found[0] if found else "")
 
     template_label = "".join(found)  # e.g. "TiC"
     _section("Species / mode")
     print(f"  Found sublattices in template: {found}")
     print(f"  Template compound             : {template_label}")
-    print(textwrap.dedent(f"""
+    print(
+        textwrap.dedent(f"""
       Enter elements for the VCA mix separated by space (e.g. 'Nb V'),
       replace a single element (e.g. 'Nb'),
-      or press Enter to run the pure template [{template_label}]:"""))
+      or press Enter to run the pure template [{template_label}]:""")
+    )
 
     # Resolve from CLI or interactive input.
     if cli_elements is not None:
@@ -360,12 +396,16 @@ def wizard_mode(
     # ── Scenario A: pure template ──────────────────────────────────────────
     if not raw_elems:
         print(f"\n  · Mode: single compound  ({template_label})")
-        run_elastic = ask_yes_no("  Run elastic constants after GeomOpt?", default=False)
+        run_elastic = ask_yes_no(
+            "  Run elastic constants after GeomOpt?", default=False
+        )
         return WizardResult(
             template_element=template,
             target_mix={template: 1.0},
             single_mode=True,
-            c_start=0.0, c_end=0.0, n_steps=0,
+            c_start=0.0,
+            c_end=0.0,
+            n_steps=0,
             nonmetal=nonmetal,
             run_elastic=run_elastic,
         )
@@ -375,14 +415,20 @@ def wizard_mode(
         new_elem = raw_elems[0]
         nm_label = nonmetal if nonmetal else ""
         compound = f"{new_elem}{nm_label}"
-        print(f"\n  · Mode: single compound  ({compound}  using {template_label} geometry)")
+        print(
+            f"\n  · Mode: single compound  ({compound}  using {template_label} geometry)"
+        )
         _warn_nonmetal_mix(new_elem, nonmetal)
-        run_elastic = ask_yes_no("  Run elastic constants after GeomOpt?", default=False)
+        run_elastic = ask_yes_no(
+            "  Run elastic constants after GeomOpt?", default=False
+        )
         return WizardResult(
             template_element=template,
             target_mix={new_elem: 1.0},
             single_mode=True,
-            c_start=0.0, c_end=0.0, n_steps=0,
+            c_start=0.0,
+            c_end=0.0,
+            n_steps=0,
             nonmetal=nonmetal,
             run_elastic=run_elastic,
         )
@@ -408,23 +454,15 @@ def wizard_mode(
     else:
         print("\n── Concentration range ──────────────────────────────────────────────")
         c_start = ask_float("Start [0-1]: ")
-        c_end   = ask_float("End   [0-1]: ")
+        c_end = ask_float("End   [0-1]: ")
         n_steps = ask_int("Intervals (e.g. 8): ")
 
-    # VEC stability preview (binary only)
+    # VEC reference table (informational — no pre-flight blocking).
     if len(elems) == 2 and nonmetal:
         import numpy as np
+
         planned_x = list(np.linspace(c_start, c_end, n_steps + 1))
         print_vec_table(elems[0], elems[1], planned_x, nonmetal)
-        filtered = ask_vec_guard(elems[0], elems[1], planned_x, nonmetal)
-        if filtered is not None and len(filtered) < len(planned_x):
-            if filtered:
-                c_end   = max(filtered)
-                n_steps = len(filtered) - 1
-            else:
-                import sys
-                print("  All steps would be skipped.  Exiting.")
-                sys.exit(0)
 
     run_elastic = ask_yes_no(
         "\n  Run elastic constants after each GeomOpt?", default=False
@@ -446,33 +484,83 @@ def _ask_ternary_fracs(
 ) -> tuple[dict[str, float], str, str]:
     """Interactively gather endpoint fractions for 3+ elements.
 
+    The first element is phased out (fraction = 0 at x=1).  The remaining
+    elements share the sublattice at x=1; their fractions must sum to 1.
+    The **last** element automatically receives whatever fraction is left,
+    preventing under-specification.  Earlier elements are bounded so that
+    the last element always retains at least a minimal share.
+
     Args:
-        elems: Element symbols for the VCA sublattice (first = dominant at x=0).
+        elems: Element symbols (first = dominant at x=0, phased out as x→1).
 
     Returns:
         ``(target_mix_at_x1, label_a, label_b)``
     """
+    import sys as _sys
+
+    new_elems = elems[1:]
     print(
         f"\n  {len(elems)} elements: {', '.join(elems)}\n"
-        f"  '{elems[0]}' is dominant at x = 0.  "
-        f"Specify fractions for the x = 1 endpoint:"
+        f"  \047{elems[0]}\047 is phased out (weight → 0 as x → 1).\n"
+        f"  Assign fractions for the {len(new_elems)} elements at the x=1 endpoint\n"
+        f"  (must sum to 1.000 — last element receives the remainder automatically):"
     )
+
     fracs: dict[str, float] = {elems[0]: 0.0}
     remaining = 1.0
-    for e in elems[1:]:
-        f = ask_float(f"  Fraction of {e} at x=1  (remaining: {remaining:.4f}): ", hi=remaining)
+
+    for i, e in enumerate(new_elems):
+        is_last = i == len(new_elems) - 1
+        if is_last:
+            f = round(remaining, 10)
+            if f < 1e-6:
+                print(
+                    f"\n  \u274c  No fraction left for \047{e}\047 "
+                    f"(remaining = {remaining:.6f}).\n"
+                    f"     Earlier fractions already sum to 1. "
+                    f"Re-run and allocate less to the other elements."
+                )
+                _sys.exit(1)
+            print(f"  Fraction of {e} at x=1  (auto-assigned remainder): {f:.4f}")
+        else:
+            # Reserve at least 1e-4 per remaining element after this one.
+            n_after = len(new_elems) - i - 1
+            hi = max(0.0, round(remaining - 1e-4 * n_after, 10))
+            if hi < 1e-6:
+                print(
+                    f"\n  \u274c  No fraction available for \047{e}\047 — "
+                    f"earlier allocations filled the budget.\n"
+                    f"     Re-run and allocate less to the previous elements."
+                )
+                _sys.exit(1)
+            f = ask_float(
+                f"  Fraction of {e} at x=1  (remaining: {remaining:.4f}, max: {hi:.4f}): ",
+                lo=0.0,
+                hi=hi,
+            )
+
         fracs[e] = f
         remaining = round(remaining - f, 10)
-    # Ensure exact sum.
-    total = sum(fracs.values())
-    if abs(total - 1.0) > 1e-4 and total > 1e-9:
-        fracs = {e: v / total for e, v in fracs.items()}
+
+    # Float-drift guard: re-normalise the new elements only.
+    total_new = sum(v for k, v in fracs.items() if k != elems[0])
+    if abs(total_new - 1.0) > 1e-3 and total_new > 1e-9:
+        scale = 1.0 / total_new
+        fracs = {
+            k: (0.0 if k == elems[0] else round(v * scale, 10))
+            for k, v in fracs.items()
+        }
+
+    parts = "  ".join(f"{e}={fracs[e]:.4f}" for e in new_elems)
+    chk = sum(fracs[e] for e in new_elems)
+    print(f"\n  ✓  Mix at x=1:  {parts}  (sum={chk:.4f})")
     return fracs, elems[0], elems[-1]
 
 
 def _warn_nonmetal_mix(elem: str, nonmetal: str) -> None:
     """Warn if the user is mixing a metal with the nonmetal sublattice."""
     from castep import config as _ccfg
+
     if elem in _ccfg.NONMETALS and nonmetal and elem != nonmetal:
         print(
             f"\n  ⚠  '{elem}' is a nonmetal — VCA on the anion sublattice is unusual.\n"
@@ -495,6 +583,7 @@ _BINARY_SEARCH = [
 def _find_binary() -> str | None:
     """Search PATH and common install locations for a CASTEP binary."""
     import glob
+
     for name in ["castep.mpi", "castep.serial", "castep"]:
         found = shutil.which(name)
         if found:
@@ -520,10 +609,11 @@ def wizard_castep_cmd(override: str | None) -> str:
 
     cpu = multiprocessing.cpu_count()
     if override:
-        tokens   = override.replace("{seed}", "").split()
+        tokens = override.replace("{seed}", "").split()
         bin_path = next(
             (
-                os.path.expanduser(t) for t in reversed(tokens)
+                os.path.expanduser(t)
+                for t in reversed(tokens)
                 if "castep" in t.lower() or Path(os.path.expanduser(t)).is_file()
             ),
             os.path.expanduser(tokens[-1]) if tokens else "",
@@ -559,7 +649,7 @@ def wizard_castep_cmd(override: str | None) -> str:
         n = cpu
 
     name = Path(bin_path).name
-    cmd  = (
+    cmd = (
         f"mpirun -n {n} {bin_path} {{seed}}"
         if "mpi" in name.lower()
         else f"{bin_path} {{seed}}"
@@ -572,17 +662,14 @@ def wizard_castep_cmd(override: str | None) -> str:
 # Step box display
 # ─────────────────────────────────────────────────────────────────────────────
 
-_VEC_ICON = {"green": "●", "yellow": "◑", "red": "○"}
-
 
 def _vec_tag(state: RunState, x: float) -> str:
-    """Build the ``VEC=8.00●`` tag shown in the step header."""
+    """Build the ``VEC=8.00`` tag shown in the step header."""
     try:
-        sp_a  = state.species[0][0]
+        sp_a = state.species[0][0]
         fracs = [(sp_a, 1.0 - x)] + [(e, f * x) for e, f in state.species[1:]]
-        vec   = phys.vec_for_system(fracs, state.nonmetal or None)
-        band  = phys.vec_stability(vec)
-        return f"  VEC={vec:.2f}{_VEC_ICON[band]}"
+        vec = phys.vec_for_system(fracs, state.nonmetal or None)
+        return f"  VEC={vec:.2f}"
     except Exception:
         return ""
 
@@ -595,7 +682,7 @@ def print_step_header(step: Step, total: int, state: RunState) -> None:
         total: Total number of steps in this run.
         state: Parent :class:`~orchestrator.RunState`.
     """
-    x   = step.concentration
+    x = step.concentration
     cmd = (
         state.castep_cmd.replace("{seed}", state.seed)
         if state.castep_cmd
@@ -607,7 +694,7 @@ def print_step_header(step: Step, total: int, state: RunState) -> None:
             f"  {state.species[1][0]}={round(x, 4)}"
         )
     else:
-        fracs    = [(state.species[0][0], round(1 - x, 4))] + [
+        fracs = [(state.species[0][0], round(1 - x, 4))] + [
             (e, round(f * x, 4)) for e, f in state.species[1:]
         ]
         sp_label = "  " + "  ".join(f"{e}={v}" for e, v in fracs)
@@ -634,20 +721,20 @@ def print_step_result(
 
     if step.status == DONE:
         conv = "✓" if step.geom_converged == "yes" else "⚠ not converged"
-        t    = _fmt_time(float(step.wall_time_s)) if step.wall_time_s else "—"
-        a    = f"a={step.a_opt_ang} Å" if step.a_opt_ang else ""
+        t = _fmt_time(float(step.wall_time_s)) if step.wall_time_s else "—"
+        a = f"a={step.a_opt_ang} Å" if step.a_opt_ang else ""
         print(
-            f"  │  ▶ Geometry Optimization … {conv}"
-            f"  ({t})  [{a}  H={step.enthalpy_eV} eV]"
+            f"  └  {conv} Geometry Optimization   ({t})  [{a}  H={step.enthalpy_eV} eV]"
         )
         if "no empty bands" in step.warnings:
-            print("  │  ⚠  Increase nextra_bands in .param (try 20 or 30)")
+            print("     ⚠  Increase nextra_bands in .param (try 20 or 30)")
         return
 
     # FAILED
     print(f"  │  ✗  FAILED  (rc={step.rc})")
     useful = [
-        ln for ln in result.stderr_tail
+        ln
+        for ln in result.stderr_tail
         if ln.strip() and "PMIX" not in ln and not ln.startswith("[")
     ][-5:]
     for ln in useful:
@@ -656,7 +743,8 @@ def print_step_result(
     log = proj_dir / step.step_dir / f"{seed}.castep"
     if log.exists():
         err_lines = [
-            ln for ln in log.read_text(errors="replace").splitlines()[-40:]
+            ln
+            for ln in log.read_text(errors="replace").splitlines()[-40:]
             if any(k in ln.lower() for k in ("error", "abort", "fatal", "failed"))
         ]
         for ln in err_lines[-4:]:
@@ -672,9 +760,9 @@ def print_step_result(
 
 def print_single_result(step: Step, seed: str) -> None:
     """Print a compact result line for a single-compound run."""
-    h  = step.parsed.get("enthalpy_eV", "—")
-    a  = step.parsed.get("a_opt_ang",   "—")
-    t  = step.parsed.get("wall_time_s", "—")
+    h = step.parsed.get("enthalpy_eV", "—")
+    a = step.parsed.get("a_opt_ang", "—")
+    t = step.parsed.get("wall_time_s", "—")
     ok = "✓" if step.status == DONE else "✗"
     print(f"\n  [{ok}] {seed}  H = {h} eV  |  a = {a} Å  |  {t}s\n")
 
@@ -682,6 +770,7 @@ def print_single_result(step: Step, seed: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Elastic sub-step display
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def print_elastic_start(n_strains: int, vec: float, nextra: int) -> None:
     """Print the elastic header line inside the step box."""
@@ -709,22 +798,19 @@ def print_elastic_result(data: dict[str, Any], elapsed: float) -> None:
         data:    Dict returned by :func:`~castep.elastic.run_elastic`.
         elapsed: Wall-clock seconds for the elastic sub-step.
     """
-    t   = _fmt_time(elapsed)
-    b   = data.get("B_Hill_GPa", "—")
-    g   = data.get("G_Hill_GPa", "—")
-    e   = data.get("E_GPa",      "—")
+    t = _fmt_time(elapsed)
+    b = data.get("B_Hill_GPa", "—")
+    g = data.get("G_Hill_GPa", "—")
+    e = data.get("E_GPa", "—")
     c11 = data.get("C11", "—")
     c12 = data.get("C12", "—")
     c44 = data.get("C44", "—")
-    r2  = data.get("elastic_R2_min", "")
+    r2 = data.get("elastic_R2_min", "")
     r2t = f"  R²={r2}" if r2 and r2 != "N/A" else ""
     src = data.get("elastic_source", "CASTEP")
     tag = "  [Vegard]" if "Vegard" in src else ""
     note = data.get("elastic_quality_note", "")
-    print(
-        f"  │  ✓ Elastic Tensors ({t}){tag}"
-        f"  [B={b}  G={g}  E={e} GPa]{r2t}"
-    )
+    print(f"  │  ✓ Elastic Tensors ({t}){tag}  [B={b}  G={g}  E={e} GPa]{r2t}")
     print(f"  │     C11={c11}  C12={c12}  C44={c44} GPa")
     if note:
         print(f"  │  ⚠  {note}")
@@ -751,7 +837,7 @@ def print_summary(state: RunState) -> None:
         state: Completed (or partial) :class:`~orchestrator.RunState`.
     """
     steps = state.steps
-    W     = min(_tw(), 92)
+    W = min(_tw(), 92)
 
     if len(state.species) == 2:
         sp_label = f"{state.species[0][0]}(1-x){state.species[1][0]}(x)"
@@ -773,7 +859,7 @@ def print_summary(state: RunState) -> None:
     )
     for s in steps:
         flag = " ⚠" if s.geom_converged == "no" and s.status == DONE else ""
-        B    = s.parsed.get("bulk_modulus_GPa", "—") or "—"
+        B = s.parsed.get("bulk_modulus_GPa", "—") or "—"
         icon = _STATUS_ICON.get(s.status, "?")
         print(
             f"  {icon}{s.idx:>3}  {s.concentration:>7.4f}  {s.status:<8}"
@@ -795,12 +881,14 @@ def print_summary(state: RunState) -> None:
 
     dh = mixing_enthalpy(steps)
     if dh:
-        print(textwrap.dedent("""
+        print(
+            textwrap.dedent("""
           ── ΔH deviation from Vegard linear mixing ──────────────────────
           · VCA ΔH values are dominated by pseudopotential offsets (~eV),
             not by chemical mixing energy (~meV).
             Use lattice parameter and Cij vs x for quantitative analysis.
-        """))
+        """)
+        )
         print(f"  {'x':>7}   {'H_total (eV)':>16}   {'ΔH_Vegard (meV/cell)':>22}")
         print(f"  {'─' * 7}   {'─' * 16}   {'─' * 22}")
         for xv, hv, dhv in dh:
@@ -814,11 +902,9 @@ def print_summary(state: RunState) -> None:
 # VEC stability table + guard
 # ─────────────────────────────────────────────────────────────────────────────
 
-_BAND_ROW = {
-    "green":  "●  Stable — SCF converges quickly",
-    "yellow": "◑  Yellow zone — SCF may need extra iterations",
-    "red":    "○  RED ZONE — Born instability likely (C44 → 0)",
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# VEC reference table  (informational only — no pre-flight blocking)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def print_vec_table(
@@ -827,104 +913,119 @@ def print_vec_table(
     concentrations: list[float],
     nonmetal: str | None,
 ) -> None:
-    """Print a VEC stability forecast table.
+    """Print the VEC reference table for the planned sweep.
 
-    Args:
-        elem_a:         Element at x = 0.
-        elem_b:         Element at x = 1.
-        concentrations: List of planned x values.
-        nonmetal:       Anion element, or ``None``.
-    """
-    print("\n  ── VEC Stability Forecast " + "─" * 44)
-    print(f"  {'x':>6}   {'VEC':>6}   Status")
-    print(f"  {'─' * 6}   {'─' * 6}   {'─' * 50}")
-    for x in concentrations:
-        sp_eval = [(elem_a, 1.0 - x), (elem_b, x)]
-        vec  = phys.vec_for_system(sp_eval, nonmetal)
-        band = phys.vec_stability(vec)
-        print(f"  {x:>6.4f}   {vec:>6.2f}   {_BAND_ROW[band]}")
-    print()
-
-
-def ask_vec_guard(
-    elem_a: str,
-    elem_b: str,
-    concentrations: list[float],
-    nonmetal: str | None,
-    threshold: float = 8.4,
-) -> list[float] | None:
-    """Show a warning and optionally filter unsafe concentrations.
+    VEC is shown as a reference value only — no traffic-light colours, no
+    pre-flight blocking.  The threshold at which SCF diverges depends on the
+    anion (C: ~8.4, N: ~9.0) and on the pseudopotential set, so the code no
+    longer makes pass/fail decisions before the calculation runs.  If a step
+    actually stalls, the watchdog kills it and the smart-retry logic applies.
 
     Args:
         elem_a:         Element at x = 0.
         elem_b:         Element at x = 1.
         concentrations: Planned x values.
-        nonmetal:       Anion element, or ``None``.
-        threshold:      VEC value above which Born instability is expected.
+        nonmetal:       Anion element (e.g. ``"C"``), or ``None``.
+    """
+    print("\n  ── VEC Reference " + "─" * 49)
+    print(f"  {'x':>6}   {'VEC':>6}   (reference — watchdog handles divergences)")
+    print(f"  {'─' * 6}   {'─' * 6}   {'─' * 45}")
+    for x in concentrations:
+        sp_eval = [(elem_a, 1.0 - x), (elem_b, x)]
+        vec = phys.vec_for_system(sp_eval, nonmetal)
+        print(f"  {x:>6.4f}   {vec:>6.2f}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart retry UI  (Task 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Human-readable descriptions for each kill/failure token.
+_ERROR_DESC: dict[str, tuple[str, str]] = {
+    "scf_nosconv": (
+        "SCF convergence failure (charge sloshing / hard divergence)",
+        "smearing_width → 0.20 eV,  mix_charge_amp → 0.05",
+    ),
+    "smax_stall": (
+        "Geometry optimisation stalled (Smax oscillating above threshold)",
+        "smearing_width → 0.20 eV,  mix_charge_amp → 0.05",
+    ),
+    "geom_high_stress": (
+        "High initial stress (possible Vegard-law mismatch in cell geometry)",
+        "geom_stress_tol → 0.10 GPa  (wider acceptance window for LBFGS)",
+    ),
+    "timeout": (
+        "Step timed out (exceeded wall-clock limit)",
+        "smearing_width → 0.20 eV,  mix_charge_amp → 0.05",
+    ),
+    "unknown": (
+        "Unknown failure — no recognisable pattern in .castep output",
+        "no automatic patch available",
+    ),
+}
+
+
+def print_smart_retry(
+    failed_steps: list["Step"],
+    state: "RunState",
+) -> list["Step"]:
+    """Display a per-step failure analysis and optionally patch + return steps to retry.
+
+    This replaces the old blunt ``"Retry failed steps? [Y/n]"`` question.
+    For each failed step the failure mode is classified, a human-readable
+    explanation is printed, and the targeted .param patch is described.
+    The user can then approve patching + retry for the fixable steps.
+
+    Args:
+        failed_steps: Steps with status ``FAILED``.
+        state:        Parent :class:`~orchestrator.RunState`.
 
     Returns:
-        Filtered x list (safe only), full list (proceed anyway), or ``None``
-        if all concentrations are below the threshold.
+        List of steps that should be retried (empty if the user declines).
     """
-    def _vec(x: float) -> float:
-        return phys.vec_for_system([(elem_a, 1.0 - x), (elem_b, x)], nonmetal)
+    from orchestrator import FAILED, patch_for_recovery
 
-    red = [x for x in concentrations if _vec(x) > threshold]
-    if not red:
-        return None
+    _section("Sweep completed — failure analysis")
 
-    safe      = [x for x in concentrations if x not in red]
-    x_first   = red[0]
-    vec_first = _vec(x_first)
-    x_max     = max(safe) if safe else None
-    skip_label = (
-        f"run only x <= {x_max:.4f}" if x_max is not None else "skip all unstable steps"
-    )
-    affected_str = "  ".join(f"x={v:.4f}" for v in red[:6])
-    if len(red) > 6:
-        affected_str += "  …"
+    n_ok = sum(1 for s in state.steps if s.status != FAILED)
+    n_fail = len(failed_steps)
+    print(f"  ✓  {n_ok} step(s) succeeded")
+    print(f"  ✗  {n_fail} step(s) failed or timed out\n")
 
-    W = min(_tw() - 4, 72)
-    print(f"\n  ╔{'═' * W}╗")
+    patchable: list["Step"] = []
+    for s in failed_steps:
+        reason = s.parsed.get("kill_reason", "unknown")
+        desc, fix = _ERROR_DESC.get(reason, _ERROR_DESC["unknown"])
+        x_str = f"x={s.concentration:.4f}"
+        print(f"  ✗  {x_str}  —  {desc}")
+        if reason != "unknown":
+            print(f"        Fix: {fix}")
+            patchable.append(s)
+        else:
+            print("        No automatic fix available.  Inspect the .castep file.")
+        print()
 
-    def _row(text: str) -> None:
-        print(f"  ║  {text:<{W - 2}}║")
+    if not patchable:
+        print("  No automatically fixable failures found.")
+        return []
 
-    _row(
-        f"⚠  WARNING: High VEC (> {threshold}) detected for x >= {x_first:.4f}"
-        f"  (VEC = {vec_first:.2f})"
-    )
-    _row("")
-    _row(f"VCA pseudo-atoms with VEC > {threshold} exhibit strong electronic")
-    _row("instability (Band Jahn-Teller).  CASTEP will likely fail to converge")
-    _row("the SCF cycle or yield C44 < 0 (Born instability).")
-    _row("")
-    _row(f"Affected steps ({len(red)}):  {affected_str}")
-    _row("")
-    _row(f"[1]  Skip unstable steps ({skip_label})  <- Recommended")
-    _row("[2]  Proceed anyway  (may hang for hours or crash)")
-    print(f"  ╚{'═' * W}╝")
+    if not ask_yes_no(
+        f"  Auto-patch .param and retry {len(patchable)} fixable step(s)?",
+        default=True,
+    ):
+        return []
 
-    while True:
-        raw = input("  Choice [1]: ").strip()
-        if raw in {"", "1"}:
-            safe_note = (
-                f"Only x <= {x_max:.4f} will be computed."
-                if x_max
-                else "All planned steps are unstable — skipping all."
-            )
-            print(
-                f"\n  ✓  Skipping {len(red)} unstable step(s) with VEC > {threshold}."
-            )
-            print(f"     {safe_note}")
-            print(
-                "     Elastic constants for skipped x will use Vegard interpolation.\n"
-            )
-            return safe
-        if raw == "2":
-            print(
-                f"\n  ⚠  Proceeding with all steps.  "
-                f"Watch for 'Born stability violated' for x >= {x_first:.4f}.\n"
-            )
-            return list(concentrations)
-        print("  Enter 1 or 2.")
+    step_dir_base = state.proj_dir
+    for s in patchable:
+        step_dir = step_dir_base / s.step_dir
+        reason = s.parsed.get("kill_reason", "unknown")
+        ok = patch_for_recovery(step_dir, state.seed, reason)
+        if ok:
+            print(f"  ✓  Patched  {s.step_dir}")
+        else:
+            print(f"  ⚠  Could not patch {s.step_dir} (.param missing?)")
+        s.status = "pending"
+        s.rc = ""
+
+    return patchable

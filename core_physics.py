@@ -41,22 +41,47 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
-
 import config
+import numpy as np
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Valence electron count table
 # ─────────────────────────────────────────────────────────────────────────────
 
 VEC_VALENCES: dict[str, int] = {
-    "Sc":  3, "Ti":  4, "V":   5, "Cr":  6, "Mn":  7,
-    "Fe":  8, "Co":  9, "Ni": 10, "Cu": 11, "Zn": 12,
-    "Y":   3, "Zr":  4, "Nb":  5, "Mo":  6, "Tc":  7,
-    "Ru":  8, "Rh":  9, "Pd": 10, "Ag": 11, "Cd": 12,
-    "Hf":  4, "Ta":  5, "W":   6, "Re":  7,
-    "B":   3, "C":   4, "N":   5, "O":   6, "F":   7,
-    "Al":  3, "Si":  4, "P":   5, "S":   6,
+    "Sc": 3,
+    "Ti": 4,
+    "V": 5,
+    "Cr": 6,
+    "Mn": 7,
+    "Fe": 8,
+    "Co": 9,
+    "Ni": 10,
+    "Cu": 11,
+    "Zn": 12,
+    "Y": 3,
+    "Zr": 4,
+    "Nb": 5,
+    "Mo": 6,
+    "Tc": 7,
+    "Ru": 8,
+    "Rh": 9,
+    "Pd": 10,
+    "Ag": 11,
+    "Cd": 12,
+    "Hf": 4,
+    "Ta": 5,
+    "W": 6,
+    "Re": 7,
+    "B": 3,
+    "C": 4,
+    "N": 5,
+    "O": 6,
+    "F": 7,
+    "Al": 3,
+    "Si": 4,
+    "P": 5,
+    "S": 6,
 }
 
 
@@ -80,25 +105,10 @@ def vec_for_system(
         # (0.6*4 + 0.4*5) + 4 = 6.8
     """
     metal_vec = sum(
-        frac * VEC_VALENCES.get(elem.capitalize(), 0)
-        for elem, frac in species
+        frac * VEC_VALENCES.get(elem.capitalize(), 0) for elem, frac in species
     )
     nm_vec = VEC_VALENCES.get(nonmetal.capitalize(), 0) if nonmetal else 0.0
     return metal_vec + nm_vec
-
-
-def vec_stability(vec: float) -> str:
-    """Classify a VEC value into a stability zone.
-
-    Returns:
-        ``"green"`` (stable), ``"yellow"`` (marginal), or ``"red"``
-        (Born instability likely), based on thresholds in ``config.py``.
-    """
-    if vec <= config.VEC_YELLOW:
-        return "green"
-    if vec <= config.VEC_RED:
-        return "yellow"
-    return "red"
 
 
 def nextra_bands_for(x: float, vec: float) -> int:
@@ -145,7 +155,9 @@ def lattice_to_abc(
     cb = float(np.clip(np.dot(L[0], L[2]) / (a * c), -1.0, 1.0))
     cg = float(np.clip(np.dot(L[0], L[1]) / (a * b), -1.0, 1.0))
     return (
-        a, b, c,
+        a,
+        b,
+        c,
         float(np.degrees(np.arccos(ca))),
         float(np.degrees(np.arccos(cb))),
         float(np.degrees(np.arccos(cg))),
@@ -153,8 +165,12 @@ def lattice_to_abc(
 
 
 def abc_to_lattice(
-    a: float, b: float, c: float,
-    alpha: float, beta: float, gamma: float,
+    a: float,
+    b: float,
+    c: float,
+    alpha: float,
+    beta: float,
+    gamma: float,
 ) -> np.ndarray:
     """Build an upper-triangular 3x3 lattice from conventional parameters.
 
@@ -172,11 +188,13 @@ def abc_to_lattice(
     cx = c * float(np.cos(br))
     cy = c * (float(np.cos(ar)) - float(np.cos(br)) * float(np.cos(gr))) / sg
     cz = float(np.sqrt(max(c**2 - cx**2 - cy**2, 0.0)))
-    return np.array([
-        [a,                     0.0,  0.0],
-        [b * float(np.cos(gr)), b * sg, 0.0],
-        [cx,                    cy,   cz],
-    ])
+    return np.array(
+        [
+            [a, 0.0, 0.0],
+            [b * float(np.cos(gr)), b * sg, 0.0],
+            [cx, cy, cz],
+        ]
+    )
 
 
 def standardize_cubic(L: np.ndarray) -> np.ndarray:
@@ -192,14 +210,14 @@ def standardize_cubic(L: np.ndarray) -> np.ndarray:
     a, b, c, al, be, ga = lattice_to_abc(L)
     avg_len = (a + b + c) / 3.0
     if max(abs(a - avg_len), abs(b - avg_len), abs(c - avg_len)) / avg_len > 0.005:
-        return L   # Not equal-length -> not cubic.
+        return L  # Not equal-length -> not cubic.
     if max(abs(al - 90), abs(be - 90), abs(ga - 90)) < 1.5:
-        return L   # Already orthogonal.
+        return L  # Already orthogonal.
     avg_ang = (al + be + ga) / 3.0
     vol = cell_volume(L)
-    if abs(avg_ang - 60.0) < 1.5:       # FCC primitive
+    if abs(avg_ang - 60.0) < 1.5:  # FCC primitive
         a_conv = (4.0 * vol) ** (1.0 / 3.0)
-    elif abs(avg_ang - 109.47) < 1.5:   # BCC primitive
+    elif abs(avg_ang - 109.47) < 1.5:  # BCC primitive
         a_conv = (2.0 * vol) ** (1.0 / 3.0)
     else:
         return L
@@ -211,21 +229,29 @@ def standardize_cubic(L: np.ndarray) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STRAIN_PATTERNS: dict[int, list[list[float]]] = {
-    1: [                                  # triclinic — all 6 independent
-        [1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0],
-        [0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1],
+    1: [  # triclinic — all 6 independent
+        [1, 0, 0, 0, 0, 0],
+        [0, 1, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 1],
     ],
-    2: [                                  # monoclinic
-        [1, 0, 0, 1, 0, 0], [0, 0, 1, 0, 0, 1],
-        [0, 1, 0, 0, 0, 0], [0, 0, 0, 0, 1, 0],
+    2: [  # monoclinic
+        [1, 0, 0, 1, 0, 0],
+        [0, 0, 1, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0],
     ],
-    3: [                                  # orthorhombic
-        [1, 0, 0, 1, 0, 0], [0, 1, 0, 0, 1, 0], [0, 0, 1, 0, 0, 1],
+    3: [  # orthorhombic
+        [1, 0, 0, 1, 0, 0],
+        [0, 1, 0, 0, 1, 0],
+        [0, 0, 1, 0, 0, 1],
     ],
-    4: [[1, 0, 0, 1, 0, 0], [0, 0, 1, 0, 0, 1]],    # tetragonal
-    5: [[1, 0, 0, 1, 0, 0]],                         # cubic
-    6: [[1, 0, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0]],    # trigonal
-    7: [[0, 0, 1, 0, 0, 0], [1, 0, 0, 1, 0, 0]],    # hexagonal
+    4: [[1, 0, 0, 1, 0, 0], [0, 0, 1, 0, 0, 1]],  # tetragonal
+    5: [[1, 0, 0, 1, 0, 0]],  # cubic
+    6: [[1, 0, 0, 0, 0, 0], [0, 0, 1, 1, 0, 0]],  # trigonal
+    7: [[0, 0, 1, 0, 0, 0], [1, 0, 0, 1, 0, 0]],  # hexagonal
 }
 
 
@@ -240,9 +266,9 @@ class StrainStep:
         strain_voigt: 6-component Voigt strain vector.
     """
 
-    pattern_idx:  int
-    step_idx:     int
-    magnitude:    float
+    pattern_idx: int
+    step_idx: int
+    magnitude: float
     strain_voigt: np.ndarray = field(repr=False)
 
     @property
@@ -271,7 +297,7 @@ def generate_strain_steps(
     patterns = _STRAIN_PATTERNS[lattice_code]
     a = float(np.linalg.norm(L[0]))
     b = float(np.linalg.norm(L[1]))
-    lens = [a, b, b, b, a, a]   # Per IRE Voigt index order.
+    lens = [a, b, b, b, a, a]  # Per IRE Voigt index order.
 
     steps: list[StrainStep] = []
     for pi, pattern in enumerate(patterns, 1):
@@ -284,11 +310,7 @@ def generate_strain_steps(
                 v = np.zeros(6)
                 for i, p in enumerate(pattern):
                     if p:
-                        v[i] = (
-                            p * mag / lens[i]
-                            if i < 3
-                            else 0.5 * p * mag / lens[i]
-                        )
+                        v[i] = p * mag / lens[i] if i < 3 else 0.5 * p * mag / lens[i]
                 steps.append(StrainStep(pi, sc, mag, v))
     return steps
 
@@ -302,11 +324,13 @@ def apply_strain(L: np.ndarray, voigt: np.ndarray) -> np.ndarray:
     """
     e11, e22, e33 = voigt[0], voigt[1], voigt[2]
     e23, e13, e12 = voigt[3] / 2, voigt[4] / 2, voigt[5] / 2
-    F = np.array([
-        [1 + e11,     e12,     e13],
-        [    e12, 1 + e22,     e23],
-        [    e13,     e23, 1 + e33],
-    ])
+    F = np.array(
+        [
+            [1 + e11, e12, e13],
+            [e12, 1 + e22, e23],
+            [e13, e23, 1 + e33],
+        ]
+    )
     return L @ F.T
 
 
@@ -319,13 +343,19 @@ def pointgroup_to_lattice_code(pg: int) -> int:
     Returns:
         Lattice symmetry code 1-7 (defaults to 5 = cubic for pg >= 28).
     """
-    if pg <= 2:  return 1   # triclinic
-    if pg <= 5:  return 2   # monoclinic
-    if pg <= 8:  return 3   # orthorhombic
-    if pg <= 15: return 4   # tetragonal
-    if pg <= 17: return 6   # trigonal
-    if pg <= 27: return 7   # hexagonal
-    return 5                # cubic
+    if pg <= 2:
+        return 1  # triclinic
+    if pg <= 5:
+        return 2  # monoclinic
+    if pg <= 8:
+        return 3  # orthorhombic
+    if pg <= 15:
+        return 4  # tetragonal
+    if pg <= 17:
+        return 6  # trigonal
+    if pg <= 27:
+        return 7  # hexagonal
+    return 5  # cubic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,28 +373,28 @@ def _ols(x: np.ndarray, y: np.ndarray) -> tuple[float, float]:
     Returns:
         ``(slope, R_squared)``
     """
-    n   = len(x)
-    sx  = float(x.sum())
-    sy  = float(y.sum())
+    n = len(x)
+    sx = float(x.sum())
+    sy = float(y.sum())
     sxx = float(np.dot(x, x))
     sxy = float(np.dot(x, y))
-    d   = n * sxx - sx * sx
+    d = n * sxx - sx * sx
     if abs(d) < 1e-30:
         return float("nan"), 0.0
     slope = (n * sxy - sx * sy) / d
-    ic    = (sy - slope * sx) / n
-    res   = float(np.sum((y - slope * x - ic) ** 2))
-    tot   = float(np.sum((y - sy / n) ** 2))
-    r2    = 1.0 - res / tot if tot > 1e-12 else 1.0
+    ic = (sy - slope * sx) / n
+    res = float(np.sum((y - slope * x - ic) ** 2))
+    tot = float(np.sum((y - sy / n) ** 2))
+    r2 = 1.0 - res / tot if tot > 1e-12 else 1.0
     return slope, r2
 
 
 def fit_cij_cubic(
-    stresses:     list[np.ndarray],
-    strains:      list[np.ndarray],
+    stresses: list[np.ndarray],
+    strains: list[np.ndarray],
     density_gcm3: float | None = None,
-    n_atoms:      int   | None = None,
-    volume_ang3:  float | None = None,
+    n_atoms: int | None = None,
+    volume_ang3: float | None = None,
 ) -> dict[str, Any]:
     """Fit C11, C12, C44 from stress-strain data (cubic symmetry).
 
@@ -389,8 +419,8 @@ def fit_cij_cubic(
     if len(stresses) < 3:
         return {"error": f"only {len(stresses)} stress tensors — need >= 3"}
 
-    sa = np.array(stresses)   # (N, 6)
-    ea = np.array(strains)    # (N, 6)
+    sa = np.array(stresses)  # (N, 6)
+    ea = np.array(strains)  # (N, 6)
 
     c11, r2_11 = _ols(ea[:, 0], sa[:, 0])
     c12, r2_12 = _ols(ea[:, 0], sa[:, 1])
@@ -401,7 +431,9 @@ def fit_cij_cubic(
 
     r2_min = min(r2_11, r2_12, r2_44)
     props = cubic_vrh(
-        c11, c12, c44,
+        c11,
+        c12,
+        c44,
         density_gcm3=density_gcm3,
         n_atoms=n_atoms,
         volume_ang3=volume_ang3,
@@ -416,11 +448,10 @@ def fit_cij_cubic(
 
     result: dict[str, Any] = {k: f"{v:.4f}" for k, v in props.items()}
     result["elastic_n_points"] = str(len(stresses))
-    result["elastic_R2_min"]   = f"{r2_min:.4f}"
+    result["elastic_R2_min"] = f"{r2_min:.4f}"
     if r2_min < 0.99:
         result["elastic_quality_note"] = (
-            f"low R2 ({r2_min:.3f}) — check SCF convergence "
-            "or increase nextra_bands"
+            f"low R2 ({r2_min:.3f}) — check SCF convergence or increase nextra_bands"
         )
     return result
 
@@ -430,8 +461,8 @@ def cubic_vrh(
     c12: float,
     c44: float,
     density_gcm3: float | None = None,
-    n_atoms:      int   | None = None,
-    volume_ang3:  float | None = None,
+    n_atoms: int | None = None,
+    volume_ang3: float | None = None,
 ) -> dict[str, float]:
     """Compute polycrystalline elastic properties from cubic Cij.
 
@@ -450,65 +481,63 @@ def cubic_vrh(
     if c11 <= 0 or c44 <= 0 or c11 <= abs(c12) or c11 + 2 * c12 <= 0:
         return {}
 
-    bv  = (c11 + 2 * c12) / 3
-    gv  = (c11 - c12 + 3 * c44) / 5
+    bv = (c11 + 2 * c12) / 3
+    gv = (c11 - c12 + 3 * c44) / 5
     den = (c11 + c12) * (c11 - c12)
     s11 = (c11 + c12) / den
     s12 = -c12 / den
     s44 = 1.0 / c44
-    br  = 1.0 / (3 * (s11 + 2 * s12))
-    gr  = 5.0 / (4 * (s11 - s12) + 3 * s44)
-    bh  = (bv + br) / 2
-    gh  = (gv + gr) / 2
-    eh  = 9 * bh * gh / (3 * bh + gh)
-    nu  = (3 * bh - 2 * gh) / (2 * (3 * bh + gh))
-    za  = 2 * c44 / (c11 - c12)
-    pugh   = gh / bh
+    br = 1.0 / (3 * (s11 + 2 * s12))
+    gr = 5.0 / (4 * (s11 - s12) + 3 * s44)
+    bh = (bv + br) / 2
+    gh = (gv + gr) / 2
+    eh = 9 * bh * gh / (3 * bh + gh)
+    nu = (3 * bh - 2 * gh) / (2 * (3 * bh + gh))
+    za = 2 * c44 / (c11 - c12)
+    pugh = gh / bh
     cauchy = c12 - c44
-    cp     = (c11 - c12) / 2
-    klein  = (c11 + 8 * c12) / (7 * c11 + 2 * c12)
-    lam    = bh - 2 * gh / 3
-    ga_a   = 1.5 * (1 + nu) / (2 - 3 * nu)
+    cp = (c11 - c12) / 2
+    klein = (c11 + 8 * c12) / (7 * c11 + 2 * c12)
+    lam = bh - 2 * gh / 3
+    ga_a = 1.5 * (1 + nu) / (2 - 3 * nu)
 
     p: dict[str, float] = {
-        "C11":                 c11,
-        "C12":                 c12,
-        "C44":                 c44,
-        "B_Voigt_GPa":         bv,
-        "B_Reuss_GPa":         br,
-        "B_Hill_GPa":          bh,
-        "G_Voigt_GPa":         gv,
-        "G_Reuss_GPa":         gr,
-        "G_Hill_GPa":          gh,
-        "E_GPa":               eh,
-        "nu":                  nu,
-        "Zener_A":             za,
-        "Pugh_ratio":          pugh,
+        "C11": c11,
+        "C12": c12,
+        "C44": c44,
+        "B_Voigt_GPa": bv,
+        "B_Reuss_GPa": br,
+        "B_Hill_GPa": bh,
+        "G_Voigt_GPa": gv,
+        "G_Reuss_GPa": gr,
+        "G_Hill_GPa": gh,
+        "E_GPa": eh,
+        "nu": nu,
+        "Zener_A": za,
+        "Pugh_ratio": pugh,
         "Cauchy_pressure_GPa": cauchy,
-        "C_prime_GPa":         cp,
-        "Kleinman_zeta":       klein,
-        "lambda_Lame_GPa":     lam,
-        "mu_Lame_GPa":         gh,
-        "acoustic_Gruneisen":  ga_a,
-        "H_Vickers_GPa":       max(0.0, 2 * (pugh**2 * gh) ** 0.585 - 3),
+        "C_prime_GPa": cp,
+        "Kleinman_zeta": klein,
+        "lambda_Lame_GPa": lam,
+        "mu_Lame_GPa": gh,
+        "acoustic_Gruneisen": ga_a,
+        "H_Vickers_GPa": max(0.0, 2 * (pugh**2 * gh) ** 0.585 - 3),
     }
 
     if density_gcm3 and density_gcm3 > 0:
         rho = density_gcm3 * 1e3
-        vl  = ((bh + 4 * gh / 3) * 1e9 / rho) ** 0.5
-        vs  = (gh * 1e9 / rho) ** 0.5
-        vm  = (1 / 3 * (2 / vs**3 + 1 / vl**3)) ** (-1 / 3)
+        vl = ((bh + 4 * gh / 3) * 1e9 / rho) ** 0.5
+        vs = (gh * 1e9 / rho) ** 0.5
+        vm = (1 / 3 * (2 / vs**3 + 1 / vl**3)) ** (-1 / 3)
         p["v_longitudinal_ms"] = vl
-        p["v_transverse_ms"]   = vs
-        p["v_mean_ms"]         = vm
+        p["v_transverse_ms"] = vs
+        p["v_mean_ms"] = vm
 
         if n_atoms and volume_ang3 and volume_ang3 > 0:
-            hbar  = 1.054571817e-34
-            kb    = 1.380649e-23
+            hbar = 1.054571817e-34
+            kb = 1.380649e-23
             n_vol = n_atoms / (volume_ang3 * 1e-30)
-            p["T_Debye_K"] = (
-                (hbar / kb) * vm * (6 * np.pi**2 * n_vol) ** (1 / 3)
-            )
+            p["T_Debye_K"] = (hbar / kb) * vm * (6 * np.pi**2 * n_vol) ** (1 / 3)
 
     return p
 
@@ -518,14 +547,21 @@ def cubic_vrh(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _VEGARD_KEYS: tuple[str, ...] = (
-    "C11", "C12", "C44",
-    "B_Hill_GPa", "G_Hill_GPa", "E_GPa", "nu",
-    "Zener_A", "Pugh_ratio", "Cauchy_pressure_GPa",
+    "C11",
+    "C12",
+    "C44",
+    "B_Hill_GPa",
+    "G_Hill_GPa",
+    "E_GPa",
+    "nu",
+    "Zener_A",
+    "Pugh_ratio",
+    "Cauchy_pressure_GPa",
 )
 
 
 def vegard_interpolate(
-    x:  float,
+    x: float,
     d0: dict[str, Any],
     d1: dict[str, Any],
 ) -> dict[str, Any]:
@@ -553,7 +589,7 @@ def vegard_interpolate(
         except ValueError:
             pass
     if r:
-        r["elastic_source"]   = "Vegard_interpolation"
+        r["elastic_source"] = "Vegard_interpolation"
         r["elastic_n_points"] = "0"
-        r["elastic_R2_min"]   = "N/A"
+        r["elastic_R2_min"] = "N/A"
     return r
