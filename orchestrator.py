@@ -1,34 +1,34 @@
 """
 orchestrator.py  —  Run state, persistence, CSV, subprocess execution.
 ════════════════════════════════════════════════════════════════════════
-No user prompts, no physics.  Pure orchestration:
-
-  RunState / Step  — data model + crash-safe JSON persistence
-  execute_step     — engine-agnostic: runs one DFT job, parses results
-  write_csv        — live CSV export
-  mixing_enthalpy  — ΔH_mix from completed steps
+RunState / Step  — data model + crash-safe JSON persistence
+execute_step     — engine-agnostic: runs one DFT job, parses results
+write_csv        — live CSV export
+mixing_enthalpy  — ΔH_mix from completed steps
 
 Watchdog
 ────────
-``run_process`` embeds a :class:`_Watchdog` that monitors the CASTEP output
+``run_process`` embeds a :class:`_Watchdog` that monitors the engine output
 while the subprocess runs and kills it automatically when:
 
-  1. Wall-clock elapsed > ``config.STEP_TIMEOUT_S`` (default 900 s / 15 min).
+  1. Wall-clock elapsed > ``config.STEP_TIMEOUT_S`` (default 1800 s).
   2. Smax oscillates above ``config.SMAX_KILL_GPa`` (default 50 GPa) for
-     ``config.SMAX_STALL_ITERS`` (default 8) consecutive LBFGS steps.
-     This is the exact signature of the TiC_base run that ran for one hour
-     with Smax bouncing between 14–270 GPa and never converging.
-  3. ``"Reached maximum number of SCF cycles"`` appears in the output
-     (charge sloshing / hard divergence).
-
-The kill reason is stored in :attr:`ExecResult.kill_reason` so
-:func:`patch_for_recovery` can apply targeted .param fixes before a retry.
+     ``config.SMAX_STALL_ITERS`` consecutive LBFGS steps.
+  3. ``"Reached maximum number of SCF cycles"`` appears in the output.
 
 Engine contract
 ───────────────
-``execute_step`` calls ``write_cell_fn(dest, x)`` and delegates output
-parsing to the Engine protocol from ``engine.py``.  Adding VASP or QE
-requires implementing that protocol only — no changes here.
+All engine-specific logic is in the engine class.  Orchestrator detects
+capabilities via ``hasattr`` (duck-typing) — no ``if engine.name ==`` anywhere.
+
+Elastic routing:
+  hasattr(engine, "run_internal_elastic")
+      → True:  engine handles it entirely (e.g. VASP IBRION=6)
+      → False: orchestrator runs finite-strain loop using
+               engine.write_singlepoint_input / engine.parse_stress_tensor
+
+Progress monitoring:
+  engine.progress_monitor(output_ref, stop_event) called in background thread.
 """
 
 from __future__ import annotations
@@ -36,17 +36,17 @@ from __future__ import annotations
 import csv
 import json
 import os
-import shutil
+from datetime import datetime
 import signal
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from dataclasses import dataclass, field, asdict  # <-- Add asdict here
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import config
+from core_physics import Crystal  # canonical location — do not redefine here
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Status constants
@@ -66,18 +66,16 @@ STATUS_ICON: dict[str, str] = {
     RUNNING: "▶",
 }
 
-# Kill-reason tokens — written into ExecResult.kill_reason and Step.parsed.
 _KR_TIMEOUT = "timeout"
-_KR_SMAX = "smax_stall"
-_KR_SCF = "scf_nosconv"
-_KR_CTRL_C = "ctrl-c"
-_KR_STRESS = "geom_high_stress"
+_KR_SMAX    = "smax_stall"
+_KR_SCF     = "scf_nosconv"
+_KR_CTRL_C  = "ctrl-c"
+_KR_STRESS  = "geom_high_stress"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data model
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 @dataclass
 class Step:
@@ -128,15 +126,8 @@ class Step:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Step":
         known = {
-            "idx",
-            "step",
-            "concentration",
-            "status",
-            "step_dir",
-            "started_at",
-            "finished_at",
-            "rc",
-            "parsed",
+            "idx", "step", "concentration", "status",
+            "step_dir", "started_at", "finished_at", "rc", "parsed",
         }
         parsed = dict(d.get("parsed") or {})
         parsed.update({k: v for k, v in d.items() if k not in known})
@@ -161,7 +152,7 @@ class RunState:
     proj_dir: Path
     template_element: str
     species: list[tuple[str, float]]
-    castep_cmd: str
+    engine_cmd: str          # renamed from castep_cmd — engine-agnostic
     c_start: float
     c_end: float
     n_steps: int
@@ -170,7 +161,13 @@ class RunState:
     nonmetal: str = ""
     nonmetal_occ: float = 1.0
     run_elastic: bool = False
+    engine_kwargs: dict = field(default_factory=dict)
     steps: list[Step] = field(default_factory=list)
+
+    # Legacy alias so old JSON state files still load
+    @property
+    def castep_cmd(self) -> str:
+        return self.engine_cmd
 
     @property
     def species_a(self) -> str:
@@ -193,7 +190,6 @@ class RunState:
         return sum(1 for s in self.steps if s.status == FAILED)
 
     def system_label(self) -> str:
-        """Human-readable formula: ``Ti(1-x)Zr(x)C``, ``Ti(1-x)[Nb0.70V0.30](x)C``."""
         if self.single_mode:
             return self.seed
         sp = self.species
@@ -208,6 +204,9 @@ class RunState:
     def to_json(self) -> dict[str, Any]:
         d = asdict(self)
         d["proj_dir"] = str(self.proj_dir)
+        d["engine_cmd"] = self.engine_cmd
+        d["castep_cmd"] = self.engine_cmd   # keep for backward compat
+        d["engine_kwargs"] = self.engine_kwargs
         d["steps"] = [s.to_dict() for s in self.steps]
         return d
 
@@ -219,13 +218,15 @@ class RunState:
             sb = d.get("species_b", "")
             raw_species = [(sa, 0.0), (sb, 1.0)] if sa and sb else [(sa, 0.0)]
         tmpl = d.get("template_element") or (raw_species[0][0] if raw_species else "")
+        # Accept both old "castep_cmd" and new "engine_cmd"
+        cmd = d.get("engine_cmd") or d.get("castep_cmd", "")
         return cls(
             version=d.get("version", "?"),
             seed=d["seed"],
             proj_dir=proj_dir,
             template_element=tmpl,
             species=raw_species,
-            castep_cmd=d.get("castep_cmd", ""),
+            engine_cmd=cmd,
             c_start=d.get("c_start", 0.0),
             c_end=d.get("c_end", 1.0),
             n_steps=d.get("n_steps", 0),
@@ -234,6 +235,7 @@ class RunState:
             nonmetal=d.get("nonmetal", ""),
             nonmetal_occ=d.get("nonmetal_occ", 1.0),
             run_elastic=d.get("run_elastic", False),
+            engine_kwargs=d.get("engine_kwargs", {}),
             steps=[Step.from_dict(s) for s in d.get("steps", [])],
         )
 
@@ -241,7 +243,6 @@ class RunState:
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def _state_path(proj_dir: Path) -> Path:
     return proj_dir / config.STATE_FILE
@@ -274,7 +275,7 @@ def new_run(
     proj_dir: Path,
     template_element: str,
     species: list[tuple[str, float]],
-    castep_cmd: str,
+    engine_cmd: str,
     c_start: float,
     c_end: float,
     n_steps: int,
@@ -282,8 +283,12 @@ def new_run(
     nonmetal: str = "",
     nonmetal_occ: float = 1.0,
     run_elastic: bool = False,
+    engine_kwargs: dict | None = None,
+    # legacy kwarg alias
+    castep_cmd: str = "",
 ) -> RunState:
     proj_dir.mkdir(parents=True, exist_ok=True)
+    cmd = engine_cmd or castep_cmd
     if single_mode:
         steps = [Step(idx=0, concentration=0.0)]
     else:
@@ -301,7 +306,7 @@ def new_run(
         proj_dir=proj_dir,
         template_element=template_element,
         species=species,
-        castep_cmd=castep_cmd,
+        engine_cmd=cmd,
         c_start=c_start,
         c_end=c_end,
         n_steps=n_steps,
@@ -310,6 +315,7 @@ def new_run(
         nonmetal=nonmetal,
         nonmetal_occ=nonmetal_occ,
         run_elastic=run_elastic,
+        engine_kwargs=engine_kwargs or {},
         steps=steps,
     )
     save_run(state)
@@ -321,73 +327,57 @@ def new_run(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CSV_FIXED = [
-    "step",
-    "concentration",
-    "status",
-    "started_at",
-    "finished_at",
-    "wall_time_s",
-    "elastic_wall_time_s",
-    "total_wall_time_s",
+    "step", "concentration", "status",
+    "started_at", "finished_at", "wall_time_s",
+    "elastic_wall_time_s", "total_wall_time_s",
 ]
 
 _CSV_ORDER = [
-    "concentration",
-    "VEC",
-    "a_opt_ang",
-    "b_opt_ang",
-    "c_opt_ang",
-    "volume_ang3",
-    "density_gcm3",
-    "enthalpy_eV",
-    "dH_mix_meV_per_fu",
-    "C11",
-    "C12",
-    "C44",
-    "B_Voigt_GPa",
-    "B_Reuss_GPa",
-    "B_Hill_GPa",
-    "G_Voigt_GPa",
-    "G_Reuss_GPa",
-    "G_Hill_GPa",
-    "E_GPa",
-    "nu",
-    "Zener_A",
-    "Pugh_ratio",
-    "Cauchy_pressure_GPa",
-    "C_prime_GPa",
-    "Kleinman_zeta",
-    "lambda_Lame_GPa",
-    "mu_Lame_GPa",
+    # ── Structure ──────────────────────────────────────────────────────────────
+    "concentration", "VEC",
+    "a_opt_ang", "b_opt_ang", "c_opt_ang", "a_prim_ang",
+    "alpha", "beta", "gamma",
+    "volume_ang3", "density_gcm3",
+    # ── Energetics ─────────────────────────────────────────────────────────────
+    "energy_ev", "free_energy_ev", "energy_0k_ev",
+    "enthalpy_eV", "dH_mix_meV_per_fu",
+    # ── Electronic ─────────────────────────────────────────────────────────────
+    "fermi_ev", "mag_moment",
+    "charge_spilling_pct",
+    "mulliken_q_C", "mulliken_q_N", "mulliken_q_O",       # nonmetals first
+    "mulliken_q_Ti", "mulliken_q_Zr", "mulliken_q_Nb",    # metals — extend as needed
+    "mulliken_q_V", "mulliken_q_Hf", "mulliken_q_Mo",
+    "bond_population_avg", "bond_length_avg_ang",
+    # ── Mechanical (elastic) ───────────────────────────────────────────────────
+    "B_lbfgs_GPa",
+    "C11", "C12", "C44",
+    "B_Voigt_GPa", "B_Reuss_GPa", "B_Hill_GPa",
+    "G_Voigt_GPa", "G_Reuss_GPa", "G_Hill_GPa",
+    "E_GPa", "nu", "Zener_A", "Pugh_ratio",
+    "Cauchy_pressure_GPa", "C_prime_GPa",
+    "Kleinman_zeta", "lambda_Lame_GPa", "mu_Lame_GPa",
     "H_Vickers_GPa",
-    "v_longitudinal_ms",
-    "v_transverse_ms",
-    "v_mean_ms",
-    "T_Debye_K",
-    "acoustic_Gruneisen",
-    "elastic_source",
-    "elastic_n_points",
-    "elastic_R2_min",
-    "elastic_quality_note",
-    "geom_converged",
-    "nextra_bands_used",
-    "kill_reason",
-    "warnings",
-    "step_dir",
-    "rc",
+    # ── Acoustic / Thermal ────────────────────────────────────────────────────
+    "v_longitudinal_ms", "v_transverse_ms", "v_mean_ms",
+    "T_Debye_K", "acoustic_Gruneisen",
+    # ── Convergence / QC ──────────────────────────────────────────────────────
+    "residual_pressure_GPa", "fmax_ev_ang",
+    "geom_converged", "nextra_bands_used", "kill_reason", "warnings",
+    # ── Elastic metadata ──────────────────────────────────────────────────────
+    "elastic_source", "elastic_n_points", "elastic_R2_min", "elastic_quality_note",
+    "elastic_wall_time_s",
+    # ── Run metadata ──────────────────────────────────────────────────────────
+    "peak_mem_mb", "step_dir", "rc",
 ]
 
 
 def write_csv(state: RunState) -> Path:
-    """Write/overwrite the live results CSV inside *state.proj_dir*."""
     dh_data = mixing_enthalpy(state.steps)
     if dh_data:
         dh_map = {x: dh for x, _, dh in dh_data}
         for s in state.steps:
             if s.status == DONE and s.concentration in dh_map:
-                s.parsed.setdefault(
-                    "dH_mix_meV_per_fu", f"{dh_map[s.concentration]:.3f}"
-                )
+                s.parsed.setdefault("dH_mix_meV_per_fu", f"{dh_map[s.concentration]:.3f}")
 
     all_keys: set[str] = set()
     for s in state.steps:
@@ -413,74 +403,58 @@ def write_csv(state: RunState) -> Path:
         f.write(f"# System  : {state.system_label()}\n")
         f.write(f"# Seed    : {state.seed}\n")
         f.write(f"# Updated : {_now()}\n#\n")
-        w = csv.DictWriter(
-            f, fieldnames=all_fields, extrasaction="ignore", restval="N/A"
-        )
+        w = csv.DictWriter(f, fieldnames=all_fields, extrasaction="ignore", restval="N/A")
         w.writeheader()
         w.writerows(s.to_dict() for s in state.steps)
     return out
 
+_VEGARD_KEYS = ("C11", "C12", "C44", "B_Hill_GPa", "G_Hill_GPa", "E_GPa", "nu", "Zener_A", "Pugh_ratio")
+def vegard_interpolate(x: float, d0: dict[str, Any], d1: dict[str, Any]) -> dict[str, Any]:
+    if not d0 or not d1: return {}
+    r = {}
+    for k in _VEGARD_KEYS:
+        if k in d0 and k in d1:
+            try: r[k] = f"{(1 - x) * float(d0[k]) + x * float(d1[k]):.4f}"
+            except ValueError: pass
+    if r: r.update({"elastic_source": "Vegard_interpolation", "elastic_n_points": "0"})
+    return r
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ΔH_mix
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def mixing_enthalpy(steps: list[Step]) -> list[tuple[float, float, float]]:
-    """Return ``[(x, H_eV, dH_meV/cell)]`` sorted by x.
+    """Return ``[(x, H_eV, dH_meV/cell)]`` sorted by x."""
 
-    Requires both x = 0 and x = 1 endpoints to be complete.
-    """
-    done = [s for s in steps if s.status == DONE and s.parsed.get("enthalpy_eV")]
+    def _h(s: Step) -> float | None:
+        try:
+            return float(s.parsed["enthalpy_eV"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    done = [s for s in steps if s.status == DONE and _h(s) is not None]
     try:
-        h0 = next(
-            float(s.parsed["enthalpy_eV"]) for s in done if abs(s.concentration) < 1e-6
-        )
-        h1 = next(
-            float(s.parsed["enthalpy_eV"])
-            for s in done
-            if abs(s.concentration - 1) < 1e-6
-        )
+        h0 = next(_h(s) for s in done if abs(s.concentration) < 1e-4)
+        h1 = next(_h(s) for s in done if abs(s.concentration - 1) < 1e-4)
     except StopIteration:
         return []
 
-    return sorted(
-        [
-            (
-                s.concentration,
-                float(s.parsed["enthalpy_eV"]),
-                (
-                    float(s.parsed["enthalpy_eV"])
-                    - ((1 - s.concentration) * h0 + s.concentration * h1)
-                )
-                * 1000,
-            )
-            for s in done
-        ],
-        key=lambda t: t[0],
-    )
+    result = []
+    for s in done:
+        h = _h(s)
+        if h is None:
+            continue
+        dh = (h - ((1 - s.concentration) * h0 + s.concentration * h1)) * 1000
+        result.append((s.concentration, h, dh))
+    return sorted(result, key=lambda t: t[0])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CASTEP output analysis  (used by watchdog + retry)
+# Failure analysis helpers (engine-agnostic watchdog patterns)
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def _parse_smax_history(text: str) -> list[float]:
-    """Return Smax (GPa) for every completed LBFGS iteration seen so far.
-
-    Parses CASTEP convergence table lines such as::
-
-        |   Smax    |   2.673547E+002 |   3.000000E-002 |  GPa | No  | <-- LBFGS
-
-    Only the *value* column (index 2 after split on ``|``) is taken.
-
-    Args:
-        text: Contents of the ``.castep`` output file.
-
-    Returns:
-        List of Smax values in order of appearance.
-    """
+    """Parse Smax (GPa) history from CASTEP LBFGS convergence lines."""
     smax: list[float] = []
     for ln in text.splitlines():
         if "Smax" in ln and "<-- LBFGS" in ln:
@@ -492,69 +466,8 @@ def _parse_smax_history(text: str) -> list[float]:
                     pass
     return smax
 
-
-def _parse_max_scf_reached(text: str) -> bool:
-    """Return ``True`` if CASTEP reported hitting the SCF cycle limit."""
-    return "Reached maximum number of SCF cycles" in text
-
-
-def _classify_failure(castep_path: Path) -> str:
-    """Classify why a step failed by inspecting its ``.castep`` output.
-
-    Returns one of the ``_KR_*`` tokens or ``"unknown"``.
-
-    Args:
-        castep_path: Path to the ``.castep`` output file (may not exist).
-    """
-    if not castep_path.exists():
-        return "unknown"
-    try:
-        text = castep_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return "unknown"
-
-    if _parse_max_scf_reached(text):
-        return _KR_SCF
-
-    smax = _parse_smax_history(text)
-    if smax:
-        # High initial stress → Vegard mismatch or wrong geometry.
-        if smax[0] > config.SMAX_KILL_GPa:
-            return _KR_STRESS
-        # Stall: last N values all above threshold.
-        window = smax[-config.SMAX_STALL_ITERS :]
-        if (
-            len(window) >= config.SMAX_STALL_ITERS
-            and min(window) > config.SMAX_KILL_GPa
-        ):
-            return _KR_SMAX
-
-    return "unknown"
-
-
 def patch_for_recovery(step_dir: Path, seed: str, error_type: str) -> bool:
-    """Patch ``{seed}.param`` in *step_dir* with conservative recovery settings.
-
-    Failure-mode → .param changes:
-
-    * ``"scf_nosconv"`` / ``"smax_stall"`` / ``"timeout"`` —
-      ``smearing_width : 0.20 eV``,  ``mix_charge_amp : 0.05``
-      (wider smearing reduces charge sloshing; lower mixing damps oscillations).
-
-    * ``"geom_high_stress"`` —
-      ``geom_stress_tol : 0.10 GPa``
-      (looser tolerance helps LBFGS escape a bad starting geometry).
-
-    Existing values are replaced in-place; missing keys are appended.
-
-    Args:
-        step_dir:   Directory containing the .param file.
-        seed:       CASTEP seed name.
-        error_type: Classification token from :func:`_classify_failure`.
-
-    Returns:
-        ``True`` if the file was found and patched, ``False`` otherwise.
-    """
+    """Patch ``{seed}.param`` in *step_dir* with conservative recovery settings."""
     param = step_dir / f"{seed}.param"
     if not param.exists():
         return False
@@ -585,7 +498,6 @@ def patch_for_recovery(step_dir: Path, seed: str, error_type: str) -> bool:
             continue
         patched.append(ln)
 
-    # Append any keys not found in the original file.
     if apply_scf:
         if "smearing_width" not in keys_done:
             patched.append("smearing_width      : 0.20 eV")
@@ -620,103 +532,22 @@ def _disarm_skip() -> None:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 
-def _progress_monitor(output_file: Path, stop: threading.Event) -> None:
-    """Background thread: one-line adaptive LBFGS + SCF progress bar.
-
-    Outer: LBFGS steps (adaptive denominator = observed_max + 2, min 5).
-    Inner: SCF cycle number within the current step.
-
-    Output::
-
-        │  [████████████░░░░░░░░░░]  60%  geo 3/3  scf 7  ⏱ 01:23
-    """
-    _BAR = 22
-    last_sz = 0
-    t0 = time.time()
-    geo = 0
-    geo_seen = 0
-    scf = 0
-
-    while not stop.is_set():
-        try:
-            sz = output_file.stat().st_size if output_file.exists() else 0
-            if sz != last_sz:
-                last_sz = sz
-                text = output_file.read_text(errors="replace")
-                for ln in text.splitlines():
-                    if "LBFGS: finished iteration" in ln:
-                        parts = ln.split()
-                        for i, tok in enumerate(parts):
-                            if tok == "iteration" and i + 1 < len(parts):
-                                try:
-                                    geo = int(parts[i + 1])
-                                    geo_seen = max(geo_seen, geo)
-                                except ValueError:
-                                    pass
-                    if "<-- SCF" in ln:
-                        s = ln.lstrip()
-                        if s and s[0].isdigit():
-                            try:
-                                scf = int(s.split()[0])
-                            except ValueError:
-                                pass
-        except OSError:
-            pass
-
-        geo_denom = max(geo_seen + 2, 5)
-        pct = min(100, geo * 100 // geo_denom)
-        filled = pct * _BAR // 100
-        bar = "█" * filled + "░" * (_BAR - filled)
-        el = int(time.time() - t0)
-        mm, ss = divmod(el, 60)
-        geo_str = f"{geo}/{geo_seen}" if geo_seen >= 1 else f"{geo}/—"
-        print(
-            f"  │  [{bar}] {pct:3d}%  geo {geo_str}  scf {scf}"
-            f"  ⏱ {mm:02d}:{ss:02d}    ",
-            end="\r",
-            flush=True,
-        )
-        stop.wait(0.8)
-
-    print(" " * 80, end="\r")
-
-
 class _Watchdog:
-    """Kill CASTEP automatically when it stalls or exceeds the time limit.
-
-    Three independent kill conditions (checked every ``_POLL_S`` seconds):
-
-    1. Wall-clock elapsed > ``config.STEP_TIMEOUT_S``.
-    2. Smax > ``config.SMAX_KILL_GPa`` for ``config.SMAX_STALL_ITERS``
-       consecutive LBFGS steps without ever dropping below the threshold.
-    3. ``"Reached maximum number of SCF cycles"`` in the output.
-
-    Args:
-        output_file: Path to the ``.castep`` file being written.
-        proc:        Running :class:`subprocess.Popen` instance.
-        stop:        Event set by the caller when the process finishes normally.
-    """
+    """Kill engine automatically when it stalls or exceeds the time limit."""
 
     _POLL_S = 10.0
 
-    def __init__(
-        self,
-        output_file: Path,
-        proc: "subprocess.Popen[bytes]",
-        stop: threading.Event,
-    ) -> None:
+    def __init__(self, output_file: Path, proc: "subprocess.Popen[bytes]", stop: threading.Event) -> None:
         self._file = output_file
         self._proc = proc
         self._stop = stop
-        self.reason = ""  # populated when a kill fires
+        self.reason = ""
 
     def run(self) -> None:
-        """Main loop — runs in a daemon thread."""
         t_start = time.monotonic()
         while not self._stop.is_set():
             elapsed = time.monotonic() - t_start
 
-            # 1. Hard timeout.
             if elapsed > config.STEP_TIMEOUT_S:
                 self.reason = _KR_TIMEOUT
                 self._kill(
@@ -732,16 +563,14 @@ class _Watchdog:
                     self._stop.wait(self._POLL_S)
                     continue
 
-                # 2. SCF non-convergence.
-                if _parse_max_scf_reached(text):
+                if "Reached maximum number of SCF cycles" in text:
                     self.reason = _KR_SCF
                     self._kill("max SCF cycles reached — charge sloshing likely")
                     return
 
-                # 3. Smax stall.
                 smax = _parse_smax_history(text)
                 if len(smax) >= config.SMAX_STALL_ITERS:
-                    window = smax[-config.SMAX_STALL_ITERS :]
+                    window = smax[-config.SMAX_STALL_ITERS:]
                     if min(window) > config.SMAX_KILL_GPa:
                         self.reason = _KR_SMAX
                         self._kill(
@@ -767,65 +596,53 @@ class _Watchdog:
 
 @dataclass
 class ExecResult:
-    """Outcome of one DFT step subprocess.
-
-    Attributes:
-        rc:          Return code, or ``None`` when killed externally.
-        skipped:     ``True`` when the user pressed Ctrl+C.
-        stderr_tail: Last 40 stderr lines (for failure diagnostics).
-        kill_reason: Non-empty when the watchdog terminated the process.
-    """
-
     rc: int | None
     skipped: bool
     stderr_tail: list[str]
     kill_reason: str = ""
 
 
-def run_process(cmd: str, cwd: Path, output_file: Path) -> ExecResult:
-    """Run *cmd* in *cwd* with progress bar, watchdog, and graceful Ctrl+C.
-
-    Args:
-        cmd:         Shell command (``{seed}`` already substituted).
-        cwd:         Subprocess working directory.
-        output_file: ``.castep`` file path for monitoring.
-
-    Returns:
-        :class:`ExecResult` with all outcome fields populated.
-    """
+def run_process(cmd: str, cwd: Path, output_file: Path, *, engine: Engine) -> ExecResult:
+    """Run cmd in cwd with real-time stdout progress monitoring and watchdog."""
     stop = threading.Event()
-    monitor = threading.Thread(
-        target=_progress_monitor, args=(output_file, stop), daemon=True
-    )
-    monitor.start()
-
     proc: "subprocess.Popen[bytes] | None" = None
-    stderr: list[str] = []
+    stderr_tail: list[str] = []
     rc = -1
     watchdog: _Watchdog | None = None
 
     _arm_skip()
     try:
+        # Запускаємо процес, перехоплюємо stdout та stderr
         proc = subprocess.Popen(
             cmd,
             shell=True,
             cwd=cwd,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        proc._cwd = cwd  # consumed by file-polling progress monitors (e.g. CASTEP)
 
+        # Запускаємо прогрес-бар РУШІЯ, передаючи йому потік процесу
+        monitor = threading.Thread(
+            target=engine.progress_monitor, args=(proc, stop), daemon=True
+        )
+        monitor.start()
+
+        # Watchdog для відстеження зависань
         watchdog = _Watchdog(output_file, proc, stop)
         wd_thread = threading.Thread(target=watchdog.run, daemon=True)
         wd_thread.start()
 
-        def _drain() -> None:
-            for raw in proc.stderr:  # type: ignore[union-attr]
-                line = raw.decode(errors="replace").rstrip()
-                stderr.append(line)
-                if len(stderr) > 40:
-                    stderr.pop(0)
+        def _drain_stderr() -> None:
+            if proc.stderr:
+                for raw in proc.stderr:
+                    line = raw.decode(errors="replace").rstrip()
+                    if line:
+                        stderr_tail.append(line)
+                        if len(stderr_tail) > 40:
+                            stderr_tail.pop(0)
 
-        drain = threading.Thread(target=_drain, daemon=True)
+        drain = threading.Thread(target=_drain_stderr, daemon=True)
         drain.start()
 
         while proc.poll() is None:
@@ -834,92 +651,61 @@ def run_process(cmd: str, cwd: Path, output_file: Path) -> ExecResult:
                 monitor.join(2)
                 proc.terminate()
                 try:
-                    proc.wait(15)
+                    proc.wait(10)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 _disarm_skip()
-                return ExecResult(
-                    rc=None, skipped=True, stderr_tail=[], kill_reason=_KR_CTRL_C
-                )
-            time.sleep(0.5)
+                return ExecResult(rc=None, skipped=True, stderr_tail=[], kill_reason=_KR_CTRL_C)
+            time.sleep(0.2)
 
-        drain.join(3)
+        drain.join(2)
         rc = proc.returncode
     except OSError as e:
-        stderr.append(str(e))
+        stderr_tail.append(str(e))
     finally:
         stop.set()
-        monitor.join(2)
+        if 'monitor' in locals(): monitor.join(2)
         _disarm_skip()
         if proc and proc.poll() is None:
             proc.kill()
 
     kill_reason = watchdog.reason if watchdog else ""
-    return ExecResult(rc=rc, skipped=False, stderr_tail=stderr, kill_reason=kill_reason)
+    return ExecResult(rc=rc, skipped=False, stderr_tail=stderr_tail, kill_reason=kill_reason)
 
-
-def cmd_is_valid(cmd: str) -> bool:
-    binary = os.path.expanduser(cmd.split()[0])
-    if Path(binary).is_absolute() or "/" in binary:
-        return Path(binary).is_file() and os.access(binary, os.X_OK)
-    return shutil.which(binary) is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step execution  (engine-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 
-
 def execute_step(
     state: RunState,
     step: Step,
-    cell_src: Path,
-    param_src: Path,
-    write_cell_fn: Callable[[Path, float], None],
-    output_suffix: str = ".castep",
+    crystal: Crystal,
+    engine,
     keep_all: bool = False,
 ) -> ExecResult:
-    """Prepare inputs, run the engine, parse outputs, persist state.
-
-    When the watchdog kills the process the kill reason is written into
-    ``step.parsed["kill_reason"]`` so the smart-retry logic in ``main.py``
-    can call :func:`patch_for_recovery` with the correct error type.
-    """
+    """Prepare inputs, run the engine, parse outputs, persist state."""
     x = step.concentration
     seed = state.seed
-    castep_base = state.proj_dir / config.CASTEP_SUBDIR
-    castep_base.mkdir(parents=True, exist_ok=True)
-    step_dir = castep_base / f"x{x:.4f}"
+
+    # Engine declares its own subdirectory name (e.g. CastepEngine.subdir_name = "CASTEP")
+    subdir_name = getattr(engine, "subdir_name", engine.name.upper())
+
+    base_dir = state.proj_dir / subdir_name
+    base_dir.mkdir(parents=True, exist_ok=True)
+    step_dir = base_dir / f"x{x:.4f}"
     step_dir.mkdir(parents=True, exist_ok=True)
-    step.step_dir = f"{config.CASTEP_SUBDIR}/x{x:.4f}"
+    step.step_dir = f"{subdir_name}/x{x:.4f}"
 
-    for src, name in [
-        (cell_src, f"original_{seed}.cell"),
-        (param_src, f"original_{seed}.param"),
-    ]:
-        dst = state.proj_dir / name
-        if not dst.exists() and src.exists():
-            shutil.copy2(src, dst)
-
-    write_cell_fn(step_dir / f"{seed}.cell", x)
-    shutil.copy2(param_src, step_dir / f"{seed}.param")
-
-    from castep.castep import nextra_for_step, patch_nextra
-
-    nextra = (
-        config.ELASTIC_NEXTRA_PURE
-        if state.single_mode
-        else nextra_for_step(state.species_a, state.species_b, x)
-    )
-    patch_nextra(step_dir / f"{seed}.param", nextra)
-    step.parsed["nextra_bands_used"] = nextra
+    engine.write_input(step_dir, seed, crystal, state.species, x)
 
     step.status = RUNNING
     step.started_at = _now()
     save_run(state)
     write_csv(state)
 
-    if not state.castep_cmd:
+    if not state.engine_cmd:
         step.status = DONE
         step.rc = "N/A"
         step.finished_at = _now()
@@ -927,8 +713,14 @@ def execute_step(
         write_csv(state)
         return ExecResult(rc=0, skipped=False, stderr_tail=[])
 
-    cmd = os.path.expanduser(state.castep_cmd.replace("{seed}", seed))
-    result = run_process(cmd, step_dir, step_dir / f"{seed}{output_suffix}")
+    output_file = (
+        step_dir / f"{seed}{engine.output_suffix}"
+        if engine.output_suffix.startswith(".")
+        else step_dir / engine.output_suffix
+    )
+    cmd = os.path.expanduser(state.engine_cmd.replace("{seed}", seed))
+
+    result = run_process(cmd, step_dir, output_file, engine=engine)
     step.finished_at = _now()
 
     if result.skipped:
@@ -937,54 +729,173 @@ def execute_step(
     else:
         step.rc = str(result.rc) if result.rc is not None else "unknown"
 
-        from castep.castep import parse_elastic_file, parse_output
+        parsed = engine.parse_output(output_file)
+        result_dict = asdict(parsed)
+        extra = result_dict.pop("extra_data", {})
 
-        parsed = parse_output(step_dir / f"{seed}{output_suffix}")
-        step.parsed.update(parsed.to_dict())
+        clean_dict = {k: v for k, v in result_dict.items() if v is not None}
+        clean_dict.update(extra)  # Flatten custom engine metrics into the root
 
-        elastic_path = step_dir / f"{seed}.elastic"
-        if elastic_path.exists():
-            step.parsed.update(parse_elastic_file(elastic_path))
+        # Normalise run_time_s → wall_time_s (Step.wall_time_s property reads this key)
+        if "run_time_s" in clean_dict and "wall_time_s" not in clean_dict:
+            clean_dict["wall_time_s"] = clean_dict["run_time_s"]
 
-        # Store kill/failure reason for smart retry.
+        step.parsed.update(clean_dict)
+
+        # Engine-specific post-parse hook (e.g. CASTEP .elastic file)
+        if hasattr(engine, "parse_extra_outputs"):
+            extra = engine.parse_extra_outputs(step_dir, seed)
+            if extra:
+                step.parsed.update(extra)
+
         if result.kill_reason:
             step.parsed["kill_reason"] = result.kill_reason
-        elif result.rc != 0:
-            step.parsed["kill_reason"] = _classify_failure(
-                step_dir / f"{seed}{output_suffix}"
-            )
 
         step.status = DONE if result.rc == 0 else FAILED
+
         if result.rc == 0 and not keep_all:
-            _cleanup(step_dir)
+            engine.cleanup(step_dir)
 
     save_run(state)
     write_csv(state)
     return result
 
 
-def _cleanup(step_dir: Path) -> None:
-    for pat in (
-        "*.castep_bin",
-        "*.check",
-        "*.cst_esp",
-        "*.bands",
-        "*.bib",
-        "*.usp",
-        "*.upf",
-        "*.oepr",
+# ─────────────────────────────────────────────────────────────────────────────
+# Elastic workflow — capability-based routing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_elastic_for_step(
+    state: RunState,
+    step: Step,
+    engine,
+) -> dict[str, str]:
+    """Route elastic calculation based on engine capabilities.
+
+    - If engine has ``run_internal_elastic``: delegate entirely.
+    - Otherwise: finite-strain loop driven by orchestrator.
+    """
+    step_dir = state.proj_dir / step.step_dir
+    seed = state.seed
+    x = step.concentration
+    density = float(step.parsed.get("density_gcm3") or 0) or None
+    volume = float(step.parsed.get("volume_ang3") or 0) or None
+
+    if hasattr(engine, "run_internal_elastic"):
+        return engine.run_internal_elastic(
+            step_dir, seed, x, state.species,
+            state.nonmetal or None, density, volume,
+        )
+
+    # ── Finite-strain fallback ────────────────────────────────────────────────
+    return _finite_strain_elastic(state, step, engine, step_dir, seed, x, density, volume)
+
+
+def _finite_strain_elastic(
+    state: RunState,
+    step: Step,
+    engine,
+    step_dir: Path,
+    seed: str,
+    x: float,
+    density_gcm3: float | None,
+    volume_ang3: float | None,
+) -> dict[str, str]:
+    """Orchestrator-driven finite-strain elastic loop.
+
+    generate_strain_steps(crystal) reads crystal.strain_pattern_code and
+    crystal.lattice_type internally — no external lattice-code mapping needed.
+
+    Requires engine to implement:
+        load_optimised_crystal(step_dir, seed) -> Crystal
+        write_singlepoint_input(dest_dir, crystal, seed, species_mix, x, strain_voigt)
+        parse_stress_tensor(output_file) -> np.ndarray  (Voigt 6-vector, GPa)
+    """
+    import numpy as np
+    from core_physics import generate_strain_steps, fit_cij_cubic
+
+    if not (
+        hasattr(engine, "write_singlepoint_input")
+        and hasattr(engine, "parse_stress_tensor")
+        and hasattr(engine, "load_optimised_crystal")
     ):
-        for f in step_dir.glob(pat):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+        return {
+            "_elastic_error": (
+                "Engine does not support finite-strain fallback — "
+                "missing write_singlepoint_input / parse_stress_tensor / load_optimised_crystal"
+            )
+        }
+
+    t0 = time.monotonic()
+
+    try:
+        opt_crystal = engine.load_optimised_crystal(step_dir, seed)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"_elastic_error": f"load_optimised_crystal failed: {exc}"}
+
+    # generate_strain_steps uses crystal.strain_pattern_code (from spglib) and
+    # handles cubic → conventional cell conversion internally.
+    strain_steps = generate_strain_steps(
+        opt_crystal,
+        max_strain=config.ELASTIC_MAX_STRAIN,
+        n_steps=config.ELASTIC_N_STEPS,
+    )
+
+    stresses: list[np.ndarray] = []
+    strains: list[np.ndarray] = []
+    step_errors: list[str] = []
+
+    for ss in strain_steps:
+        sub_seed = f"{seed}{ss.name}"
+
+        try:
+            engine.write_singlepoint_input(
+                step_dir, opt_crystal, sub_seed, state.species, x, ss.strain_voigt
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            step_errors.append(f"{ss.name}: write failed: {exc}")
+            continue
+
+        output_file = (
+            step_dir / f"{sub_seed}{engine.output_suffix}"
+            if engine.output_suffix.startswith(".")
+            else step_dir / engine.output_suffix
+        )
+        cmd = os.path.expanduser(state.engine_cmd.replace("{seed}", sub_seed))
+        run_process(cmd, step_dir, output_file, engine=engine)
+
+        try:
+            sv = engine.parse_stress_tensor(output_file)
+        except (FileNotFoundError, ValueError) as exc:
+            step_errors.append(f"{ss.name}: parse failed: {exc}")
+            continue
+
+        stresses.append(sv)
+        strains.append(ss.strain_voigt)
+
+    if len(stresses) < 3:
+        error_detail = "; ".join(step_errors) if step_errors else "no step errors recorded"
+        return {
+            "_elastic_error": (
+                f"Not enough stress tensors ({len(stresses)}/{len(strain_steps)}). "
+                f"Step errors: {error_detail}"
+            )
+        }
+
+    result = fit_cij_cubic(
+        stresses, strains,
+        density_gcm3=density_gcm3,
+        n_atoms=opt_crystal.num_atoms,
+        volume_ang3=volume_ang3,
+    )
+    result["elastic_wall_time_s"] = f"{time.monotonic() - t0:.0f}"
+    result["elastic_source"] = f"{engine.name.upper()}-FiniteStrain-{opt_crystal.lattice_type}"
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
