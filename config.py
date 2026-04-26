@@ -22,10 +22,6 @@ SWEEP_C_START: float = 0.0
 SWEEP_C_END: float = 1.0
 SWEEP_N_DEFAULT: int = 8
 
-# ── VEC Stability Thresholds (Ti-Nb-C heuristic) ─────────────────────────────
-VEC_YELLOW: float = 8.2  # Marginal zone — extra SCF iterations often needed
-VEC_RED: float = 8.4     # Born instability zone — C44 likely negative
-
 # ── Elastic Workflow ─────────────────────────────────────────────────────────
 ELASTIC_MAX_STRAIN: float = 0.003  # Increased to override SCF noise
 ELASTIC_N_STEPS: int = 3

@@ -51,6 +51,48 @@ def vec_for_system(species: list[tuple[str, float]], nonmetal: str | None = None
     nm_vec = config.ELEMENTS.get(nonmetal.capitalize(), {}).get("val", 0) if nonmetal else 0
     return metal_vec + nm_vec
 
+
+def apply_vegard_scaling(
+    crystal: "Crystal",
+    template_element: str,
+    target_mix: dict[str, float],
+) -> "Crystal":
+    """Return Crystal with lattice uniformly scaled by Vegard law: k = r_mix / r_template.
+
+    Works for any space group — no structural prototype assumptions.
+    Returns the original crystal unchanged when k ≈ 1 or radii are unknown.
+    """
+    eps = 1e-9
+    nonzero_mix = {e: f for e, f in target_mix.items() if f > eps}
+    if not nonzero_mix:
+        return crystal
+
+    r_template = config.ELEMENTS.get(template_element.capitalize(), {}).get("rad", 0.0)
+    if r_template < 1e-6:
+        return crystal
+
+    # Include the remaining template-element fraction so Vegard is correct at
+    # intermediate compositions: r_mix = r_tmpl*(1-Σf) + Σ(r_i * f_i)
+    total_new_frac = sum(nonzero_mix.values())
+    template_remaining = max(0.0, 1.0 - total_new_frac)
+    r_mix = r_template * template_remaining + sum(
+        config.ELEMENTS.get(e.capitalize(), {}).get("rad", 0.0) * f
+        for e, f in nonzero_mix.items()
+    )
+
+    if r_mix < 1e-6:
+        return crystal
+
+    k = r_mix / r_template
+    if abs(k - 1.0) < 1e-9:
+        return crystal
+
+    return Crystal(
+        lattice=crystal.lattice * k,
+        frac_coords=crystal.frac_coords.copy(),
+        species=list(crystal.species),
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core Data Structures
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,6 +256,8 @@ def _read_cif_raw(text: str) -> Crystal:
                 pass
     return Crystal(lattice=L, frac_coords=np.array(fc_list), species=sp)
 
+# ==> core_physics.py <==
+
 def _read_castep_cell(text: str) -> Crystal:
     m_lat = re.search(r"%BLOCK\s+LATTICE_CART\s*\n(.*?)%ENDBLOCK\s+LATTICE_CART", text, re.DOTALL | re.I)
     vecs = []
@@ -230,9 +274,15 @@ def _read_castep_cell(text: str) -> Crystal:
     for line in m_pos.group(1).splitlines():
         parts = line.split()
         if len(parts) >= 4 and parts[0].isalpha():
-            sp.append(parts[0].capitalize())
-            fc.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            c = [float(parts[1]), float(parts[2]), float(parts[3])]
+
+            # VCA Deduplication: Ignore virtual mixture components at the exact same site
+            if not any(np.allclose(c, ex_c, atol=1e-4) for ex_c in fc):
+                sp.append(parts[0].capitalize())
+                fc.append(c)
+
     return Crystal(lattice=np.array(vecs), frac_coords=np.array(fc), species=sp)
+
 
 def _read_vasp_poscar(text: str) -> Crystal:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -241,19 +291,27 @@ def _read_vasp_poscar(text: str) -> Crystal:
 
     species_names = lines[5].split()
     counts = [int(x) for x in lines[6].split()]
-    sp = []
+
+    raw_sp = []
     for name, count in zip(species_names, counts):
-        sp.extend([name.capitalize()] * count)
+        raw_sp.extend([name.capitalize()] * count)
 
     start_idx = 8 if lines[7].lower().startswith("d") or lines[7].lower().startswith("c") else 7
     if lines[7].lower().startswith("s"): start_idx += 1
 
-    fc = []
+    raw_fc = []
     for line in lines[start_idx:start_idx + sum(counts)]:
-        fc.append([float(x) for x in line.split()[:3]])
+        raw_fc.append([float(x) for x in line.split()[:3]])
 
     if lines[start_idx-1].lower().startswith("c") or lines[start_idx-1].lower().startswith("k"):
-        fc = np.array(fc) @ np.linalg.inv(np.array(vecs))
+        raw_fc = np.array(raw_fc) @ np.linalg.inv(np.array(vecs))
+
+    sp, fc = [], []
+    for s, c in zip(raw_sp, raw_fc):
+        # VCA Deduplication: Ensure only one physical atom per site
+        if not any(np.allclose(c, ex_c, atol=1e-4) for ex_c in fc):
+            sp.append(s)
+            fc.append(c)
 
     return Crystal(lattice=np.array(vecs), frac_coords=np.array(fc), species=sp)
 

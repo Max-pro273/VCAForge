@@ -23,7 +23,7 @@ from typing import Any
 
 import config as _cfg
 import core_physics as _phys
-from core_physics import Crystal
+from core_physics import Crystal, apply_vegard_scaling
 from engines.engine import EngineResult, find_engine_binary, register_engine
 
 from engines.VASP.POSCAR_INCAR import (
@@ -219,15 +219,17 @@ class VaspEngine:
             crystal: Crystal,
             species_mix: list[tuple[str, float]],
             x: float,
+            template_element: str,
         ) -> None:
-            tmpl_elem = species_mix[0][0]
-            target_mix = {tmpl_elem: 1.0 - x}
+            target_mix = {species_mix[0][0]: 1.0 - x}
             for e, f in species_mix[1:]:
                 target_mix[e] = f * x
 
+            scaled = apply_vegard_scaling(crystal, template_element, target_mix)
+
             # 1. POSCAR (Delegates to POSCAR_INCAR.py pure functions)
             ord_elems, vca_weights = write_vca_poscar(
-                dest_dir / "POSCAR", crystal, tmpl_elem, target_mix, vegard=True
+                dest_dir / "POSCAR", scaled, template_element, target_mix
             )
 
             # 2. POTCAR (Raises explicit error if fails)

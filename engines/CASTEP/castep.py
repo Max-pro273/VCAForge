@@ -15,12 +15,9 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
-
 import config as _cfg
-from core_physics import Crystal, nextra_bands_for, load_crystal
-from engines.engine import EngineResult, find_engine_binary, register_engine, read_tail
-
+import numpy as np
+from core_physics import Crystal, apply_vegard_scaling, load_crystal, nextra_bands_for
 from engines.CASTEP.cell_param import (
     parse_elastic_file,
     parse_output,
@@ -28,15 +25,19 @@ from engines.CASTEP.cell_param import (
     write_engine_params,
     write_vca_cell,
 )
+from engines.engine import EngineResult, read_tail, register_engine
+
 
 def _species_vec(species_mix: list[tuple[str, float]]) -> float:
     from core_physics import vec_for_system
     return vec_for_system(species_mix)
 
 def _wizard_engine_cmd(override_cmd: str | None) -> str:
-    import ui
     import glob
-    if override_cmd: return override_cmd
+
+    import ui
+    if override_cmd:
+        return override_cmd
 
     cpu = os.cpu_count() or 4
     ui.section("Engine execution (CASTEP)")
@@ -63,14 +64,17 @@ def _wizard_engine_cmd(override_cmd: str | None) -> str:
     if not bin_path:
         print("  ⚠  CASTEP executable not found automatically.")
         ans = ui.ask_str("  Provide absolute path to castep.mpi (or 'skip'): ").strip()
-        if ans.lower() == "skip": return ""
+        if ans.lower() == "skip":
+            return ""
         bin_path = os.path.expanduser(ans)
     else:
         print(f"  ✓  Found executable: {bin_path}")
 
     raw = ui.ask_str(f"  MPI processes [{cpu}]: ", str(cpu))
-    try: n = max(1, int(raw))
-    except ValueError: n = cpu
+    try:
+        n = max(1, int(raw))
+    except ValueError:
+        n = cpu
 
     name = Path(bin_path).name
     cmd = f"mpirun -n {n} {bin_path} {{seed}}" if "mpi" in name.lower() else f"{bin_path} {{seed}}"
@@ -135,13 +139,14 @@ class CastepEngine:
         crystal: Crystal,
         species_mix: list[tuple[str, float]],
         x: float,
+        template_element: str,
     ) -> None:
-        tmpl_elem = species_mix[0][0]
-        target_mix = {tmpl_elem: 1.0 - x}
+        target_mix = {species_mix[0][0]: 1.0 - x}
         for e, f in species_mix[1:]:
             target_mix[e] = f * x
 
-        write_vca_cell(dest_dir / f"{seed}.cell", crystal, tmpl_elem, target_mix)
+        scaled = apply_vegard_scaling(crystal, template_element, target_mix)
+        write_vca_cell(dest_dir / f"{seed}.cell", scaled, template_element, target_mix)
         dest_param = dest_dir / f"{seed}.param"
         shutil.copy2(self.param_src, dest_param)
         patch_nextra(dest_param, nextra_bands_for(x, _species_vec(species_mix)))

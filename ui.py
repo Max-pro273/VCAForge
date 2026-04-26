@@ -194,13 +194,24 @@ def wizard_mode(
     cli_range: tuple[float, float, int] | None,
 ) -> WizardResult:
     all_species = list(dict.fromkeys(crystal.species))
+    nonmetals = [s for s in all_species if s in {"C", "N", "O", "B", "H", "P", "S", "F", "Cl", "Si"}]
     metals = [s for s in all_species if s not in {"C", "N", "O", "B", "H", "P", "S", "F", "Cl", "Si"}]
-    nonmetals = [s for s in all_species if s in {"C", "N", "B"}]
-    template = metals[0] if metals else (all_species[0] if all_species else "X")
     nonmetal = nonmetals[0] if nonmetals else ""
-    template_label = f"{template}{nonmetal}" if nonmetal else template
+    default_tmpl = metals[0] if metals else (all_species[0] if all_species else "X")
 
     section("Species / mode")
+
+    # Explicit sublattice selection (interactive mode only)
+    if cli_elements is None and len(all_species) > 1:
+        print(f"\n  Structure elements: {', '.join(all_species)}")
+        print(f"  ┌ Which element in the original structure should be replaced by the VCA mixture?")
+        print(f"  │  Options: {', '.join(all_species)}")
+        print("  └")
+        template = ask_choice(all_species, default_tmpl)
+    else:
+        template = default_tmpl
+
+    template_label = f"{template}{nonmetal}" if nonmetal else template
     if cli_elements is not None:
         raw_elems = [e.capitalize() for e in cli_elements]
     else:

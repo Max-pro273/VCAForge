@@ -25,18 +25,15 @@ def write_vca_poscar(
     crystal: Crystal,
     template_element: str,
     target_mix: dict[str, float],
-    vegard: bool = True,
 ) -> tuple[list[str], list[float]]:
+    """Write VASP POSCAR for a VCA calculation.
 
+    Vegard scaling must be applied by the caller via core_physics.apply_vegard_scaling
+    before passing crystal here.
+    """
     L = crystal.lattice.copy()
     eps = 1e-8
     nonzero_mix = {e: f for e, f in target_mix.items() if f > eps}
-
-    if vegard and len(nonzero_mix) > 1:
-        r_tmpl = _cfg.ELEMENTS.get(template_element.capitalize(), {}).get("rad", 0.0)
-        r_mix = sum(_cfg.ELEMENTS.get(e.capitalize(), {}).get("rad", 0.0) * f for e, f in nonzero_mix.items())
-        if r_tmpl > eps and r_mix > eps:
-            L *= (r_mix / r_tmpl)
 
     vca_coords = []
     other_coords: dict[str, list[np.ndarray]] = {}

@@ -698,7 +698,7 @@ def execute_step(
     step_dir.mkdir(parents=True, exist_ok=True)
     step.step_dir = f"{subdir_name}/x{x:.4f}"
 
-    engine.write_input(step_dir, seed, crystal, state.species, x)
+    engine.write_input(step_dir, seed, crystal, state.species, x, state.template_element)
 
     step.status = RUNNING
     step.started_at = _now()
@@ -801,16 +801,6 @@ def _finite_strain_elastic(
     density_gcm3: float | None,
     volume_ang3: float | None,
 ) -> dict[str, str]:
-    """Orchestrator-driven finite-strain elastic loop.
-
-    generate_strain_steps(crystal) reads crystal.strain_pattern_code and
-    crystal.lattice_type internally — no external lattice-code mapping needed.
-
-    Requires engine to implement:
-        load_optimised_crystal(step_dir, seed) -> Crystal
-        write_singlepoint_input(dest_dir, crystal, seed, species_mix, x, strain_voigt)
-        parse_stress_tensor(output_file) -> np.ndarray  (Voigt 6-vector, GPa)
-    """
     import numpy as np
     from core_physics import generate_strain_steps, fit_cij_cubic
 
