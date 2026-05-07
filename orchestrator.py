@@ -10,25 +10,20 @@ Watchdog
 ────────
 ``run_process`` embeds a :class:`_Watchdog` that monitors the engine output
 while the subprocess runs and kills it automatically when:
-
   1. Wall-clock elapsed > ``config.STEP_TIMEOUT_S`` (default 1800 s).
-  2. Smax oscillates above ``config.SMAX_KILL_GPa`` (default 50 GPa) for
-     ``config.SMAX_STALL_ITERS`` consecutive LBFGS steps.
-  3. ``"Reached maximum number of SCF cycles"`` appears in the output.
+  2. If the engine is WatchdogCapable, it delegates health checks to:
+     `engine.check_health(log_tail) -> str | None`.
+     The orchestrator DOES NOT parse regexes or specific engine errors.
 
 Engine contract
 ───────────────
-All engine-specific logic is in the engine class.  Orchestrator detects
-capabilities via ``hasattr`` (duck-typing) — no ``if engine.name ==`` anywhere.
+All engine-specific logic is in the engine class. Orchestrator detects
+capabilities ONLY via isinstance() — no ``hasattr()`` or ``engine.name ==``.
 
 Elastic routing:
-  hasattr(engine, "run_internal_elastic")
+  isinstance(engine, ElasticCapable)
       → True:  engine handles it entirely (e.g. VASP IBRION=6)
-      → False: orchestrator runs finite-strain loop using
-               engine.write_singlepoint_input / engine.parse_stress_tensor
-
-Progress monitoring:
-  engine.progress_monitor(output_ref, stop_event) called in background thread.
+      → False: orchestrator runs finite-strain loop using FiniteStrainCapable.
 """
 
 from __future__ import annotations
@@ -36,17 +31,24 @@ from __future__ import annotations
 import csv
 import json
 import os
-from datetime import datetime
 import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict  # <-- Add asdict here
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import config
-from core_physics import Crystal  # canonical location — do not redefine here
+from core_physics import Crystal
+from engines.engine import (
+    BaseEngine,
+    ElasticCapable,
+    FiniteStrainCapable,
+    WatchdogCapable,
+    read_tail,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Status constants
@@ -67,19 +69,21 @@ STATUS_ICON: dict[str, str] = {
 }
 
 _KR_TIMEOUT = "timeout"
-_KR_SMAX    = "smax_stall"
-_KR_SCF     = "scf_nosconv"
-_KR_CTRL_C  = "ctrl-c"
-_KR_STRESS  = "geom_high_stress"
+_KR_CTRL_C = "ctrl-c"
+
+
+class IncompatibleMode(Exception):
+    """Raised when the chosen engine does not support the requested crystal mode."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data model
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class Step:
-    """One concentration point in a VCA sweep, or a single-compound run."""
+    """One concentration point in a VCA/SQS sweep, or a single-compound run."""
 
     idx: int
     concentration: float
@@ -126,8 +130,15 @@ class Step:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Step":
         known = {
-            "idx", "step", "concentration", "status",
-            "step_dir", "started_at", "finished_at", "rc", "parsed",
+            "idx",
+            "step",
+            "concentration",
+            "status",
+            "step_dir",
+            "started_at",
+            "finished_at",
+            "rc",
+            "parsed",
         }
         parsed = dict(d.get("parsed") or {})
         parsed.update({k: v for k, v in d.items() if k not in known})
@@ -152,7 +163,7 @@ class RunState:
     proj_dir: Path
     template_element: str
     species: list[tuple[str, float]]
-    engine_cmd: str          # renamed from castep_cmd — engine-agnostic
+    engine_cmd: str
     c_start: float
     c_end: float
     n_steps: int
@@ -161,13 +172,10 @@ class RunState:
     nonmetal: str = ""
     nonmetal_occ: float = 1.0
     run_elastic: bool = False
-    engine_kwargs: dict = field(default_factory=dict)
+    engine_kwargs: dict[str, Any] = field(default_factory=dict)
+    crystal_mode: str = "vca"
+    engine_name: str = ""
     steps: list[Step] = field(default_factory=list)
-
-    # Legacy alias so old JSON state files still load
-    @property
-    def castep_cmd(self) -> str:
-        return self.engine_cmd
 
     @property
     def species_a(self) -> str:
@@ -205,8 +213,9 @@ class RunState:
         d = asdict(self)
         d["proj_dir"] = str(self.proj_dir)
         d["engine_cmd"] = self.engine_cmd
-        d["castep_cmd"] = self.engine_cmd   # keep for backward compat
         d["engine_kwargs"] = self.engine_kwargs
+        d["crystal_mode"] = self.crystal_mode
+        d["engine_name"] = self.engine_name
         d["steps"] = [s.to_dict() for s in self.steps]
         return d
 
@@ -218,7 +227,6 @@ class RunState:
             sb = d.get("species_b", "")
             raw_species = [(sa, 0.0), (sb, 1.0)] if sa and sb else [(sa, 0.0)]
         tmpl = d.get("template_element") or (raw_species[0][0] if raw_species else "")
-        # Accept both old "castep_cmd" and new "engine_cmd"
         cmd = d.get("engine_cmd") or d.get("castep_cmd", "")
         return cls(
             version=d.get("version", "?"),
@@ -236,6 +244,8 @@ class RunState:
             nonmetal_occ=d.get("nonmetal_occ", 1.0),
             run_elastic=d.get("run_elastic", False),
             engine_kwargs=d.get("engine_kwargs", {}),
+            crystal_mode=d.get("crystal_mode", "vca"),
+            engine_name=d.get("engine_name", ""),
             steps=[Step.from_dict(s) for s in d.get("steps", [])],
         )
 
@@ -243,6 +253,7 @@ class RunState:
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _state_path(proj_dir: Path) -> Path:
     return proj_dir / config.STATE_FILE
@@ -276,6 +287,7 @@ def new_run(
     template_element: str,
     species: list[tuple[str, float]],
     engine_cmd: str,
+    engine_name: str = "",
     c_start: float,
     c_end: float,
     n_steps: int,
@@ -283,12 +295,10 @@ def new_run(
     nonmetal: str = "",
     nonmetal_occ: float = 1.0,
     run_elastic: bool = False,
-    engine_kwargs: dict | None = None,
-    # legacy kwarg alias
-    castep_cmd: str = "",
+    engine_kwargs: dict[str, Any] | None = None,
+    crystal_mode: str = "vca",
 ) -> RunState:
     proj_dir.mkdir(parents=True, exist_ok=True)
-    cmd = engine_cmd or castep_cmd
     if single_mode:
         steps = [Step(idx=0, concentration=0.0)]
     else:
@@ -306,7 +316,7 @@ def new_run(
         proj_dir=proj_dir,
         template_element=template_element,
         species=species,
-        engine_cmd=cmd,
+        engine_cmd=engine_cmd,
         c_start=c_start,
         c_end=c_end,
         n_steps=n_steps,
@@ -316,6 +326,8 @@ def new_run(
         nonmetal_occ=nonmetal_occ,
         run_elastic=run_elastic,
         engine_kwargs=engine_kwargs or {},
+        crystal_mode=crystal_mode,
+        engine_name=engine_name,
         steps=steps,
     )
     save_run(state)
@@ -327,47 +339,95 @@ def new_run(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CSV_FIXED = [
-    "step", "concentration", "status",
-    "started_at", "finished_at", "wall_time_s",
-    "elastic_wall_time_s", "total_wall_time_s",
+    "step",
+    "concentration",
+    "status",
+    "started_at",
+    "finished_at",
+    "wall_time_s",
+    "elastic_wall_time_s",
+    "total_wall_time_s",
 ]
 
 _CSV_ORDER = [
     # ── Structure ──────────────────────────────────────────────────────────────
-    "concentration", "VEC",
-    "a_opt_ang", "b_opt_ang", "c_opt_ang", "a_prim_ang",
-    "alpha", "beta", "gamma",
-    "volume_ang3", "density_gcm3",
+    "concentration",
+    "VEC",
+    "a_opt_ang",
+    "b_opt_ang",
+    "c_opt_ang",
+    "a_prim_ang",
+    "alpha",
+    "beta",
+    "gamma",
+    "volume_ang3",
+    "density_gcm3",
     # ── Energetics ─────────────────────────────────────────────────────────────
-    "energy_ev", "free_energy_ev", "energy_0k_ev",
-    "enthalpy_eV", "dH_mix_meV_per_fu",
+    "energy_ev",
+    "free_energy_ev",
+    "energy_0k_ev",
+    "enthalpy_eV",
+    "dH_mix_meV_per_fu",
     # ── Electronic ─────────────────────────────────────────────────────────────
-    "fermi_ev", "mag_moment",
+    "fermi_ev",
+    "mag_moment",
     "charge_spilling_pct",
-    "mulliken_q_C", "mulliken_q_N", "mulliken_q_O",       # nonmetals first
-    "mulliken_q_Ti", "mulliken_q_Zr", "mulliken_q_Nb",    # metals — extend as needed
-    "mulliken_q_V", "mulliken_q_Hf", "mulliken_q_Mo",
-    "bond_population_avg", "bond_length_avg_ang",
+    "mulliken_q_C",
+    "mulliken_q_N",
+    "mulliken_q_O",
+    "mulliken_q_Ti",
+    "mulliken_q_Zr",
+    "mulliken_q_Nb",
+    "mulliken_q_V",
+    "mulliken_q_Hf",
+    "mulliken_q_Mo",
+    "bond_population_avg",
+    "bond_length_avg_ang",
     # ── Mechanical (elastic) ───────────────────────────────────────────────────
     "B_lbfgs_GPa",
-    "C11", "C12", "C44",
-    "B_Voigt_GPa", "B_Reuss_GPa", "B_Hill_GPa",
-    "G_Voigt_GPa", "G_Reuss_GPa", "G_Hill_GPa",
-    "E_GPa", "nu", "Zener_A", "Pugh_ratio",
-    "Cauchy_pressure_GPa", "C_prime_GPa",
-    "Kleinman_zeta", "lambda_Lame_GPa", "mu_Lame_GPa",
+    "C11",
+    "C12",
+    "C44",
+    "B_Voigt_GPa",
+    "B_Reuss_GPa",
+    "B_Hill_GPa",
+    "G_Voigt_GPa",
+    "G_Reuss_GPa",
+    "G_Hill_GPa",
+    "E_GPa",
+    "nu",
+    "Zener_A",
+    "Pugh_ratio",
+    "Cauchy_pressure_GPa",
+    "C_prime_GPa",
+    "Kleinman_zeta",
+    "lambda_Lame_GPa",
+    "mu_Lame_GPa",
     "H_Vickers_GPa",
+    "born_stable",
     # ── Acoustic / Thermal ────────────────────────────────────────────────────
-    "v_longitudinal_ms", "v_transverse_ms", "v_mean_ms",
-    "T_Debye_K", "acoustic_Gruneisen",
+    "v_longitudinal_ms",
+    "v_transverse_ms",
+    "v_mean_ms",
+    "T_Debye_K",
+    "acoustic_Gruneisen",
     # ── Convergence / QC ──────────────────────────────────────────────────────
-    "residual_pressure_GPa", "fmax_ev_ang",
-    "geom_converged", "nextra_bands_used", "kill_reason", "warnings",
+    "residual_pressure_GPa",
+    "fmax_ev_ang",
+    "geom_converged",
+    "nextra_bands_used",
+    "kill_reason",
+    "warnings",
     # ── Elastic metadata ──────────────────────────────────────────────────────
-    "elastic_source", "elastic_n_points", "elastic_R2_min", "elastic_quality_note",
+    "elastic_source",
+    "elastic_n_points",
+    "elastic_R2_min",
+    "elastic_quality_note",
     "elastic_wall_time_s",
     # ── Run metadata ──────────────────────────────────────────────────────────
-    "peak_mem_mb", "step_dir", "rc",
+    "peak_mem_mb",
+    "step_dir",
+    "rc",
 ]
 
 
@@ -377,7 +437,9 @@ def write_csv(state: RunState) -> Path:
         dh_map = {x: dh for x, _, dh in dh_data}
         for s in state.steps:
             if s.status == DONE and s.concentration in dh_map:
-                s.parsed.setdefault("dH_mix_meV_per_fu", f"{dh_map[s.concentration]:.3f}")
+                s.parsed.setdefault(
+                    "dH_mix_meV_per_fu", f"{dh_map[s.concentration]:.3f}"
+                )
 
     all_keys: set[str] = set()
     for s in state.steps:
@@ -403,25 +465,13 @@ def write_csv(state: RunState) -> Path:
         f.write(f"# System  : {state.system_label()}\n")
         f.write(f"# Seed    : {state.seed}\n")
         f.write(f"# Updated : {_now()}\n#\n")
-        w = csv.DictWriter(f, fieldnames=all_fields, extrasaction="ignore", restval="N/A")
+        w = csv.DictWriter(
+            f, fieldnames=all_fields, extrasaction="ignore", restval="N/A"
+        )
         w.writeheader()
         w.writerows(s.to_dict() for s in state.steps)
     return out
 
-_VEGARD_KEYS = ("C11", "C12", "C44", "B_Hill_GPa", "G_Hill_GPa", "E_GPa", "nu", "Zener_A", "Pugh_ratio")
-def vegard_interpolate(x: float, d0: dict[str, Any], d1: dict[str, Any]) -> dict[str, Any]:
-    if not d0 or not d1: return {}
-    r = {}
-    for k in _VEGARD_KEYS:
-        if k in d0 and k in d1:
-            try: r[k] = f"{(1 - x) * float(d0[k]) + x * float(d1[k]):.4f}"
-            except ValueError: pass
-    if r: r.update({"elastic_source": "Vegard_interpolation", "elastic_n_points": "0"})
-    return r
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ΔH_mix
-# ─────────────────────────────────────────────────────────────────────────────
 
 def mixing_enthalpy(steps: list[Step]) -> list[tuple[float, float, float]]:
     """Return ``[(x, H_eV, dH_meV/cell)]`` sorted by x."""
@@ -450,67 +500,6 @@ def mixing_enthalpy(steps: list[Step]) -> list[tuple[float, float, float]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Failure analysis helpers (engine-agnostic watchdog patterns)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_smax_history(text: str) -> list[float]:
-    """Parse Smax (GPa) history from CASTEP LBFGS convergence lines."""
-    smax: list[float] = []
-    for ln in text.splitlines():
-        if "Smax" in ln and "<-- LBFGS" in ln:
-            parts = ln.split("|")
-            if len(parts) >= 4:
-                try:
-                    smax.append(float(parts[2].strip()))
-                except ValueError:
-                    pass
-    return smax
-
-def patch_for_recovery(step_dir: Path, seed: str, error_type: str) -> bool:
-    """Patch ``{seed}.param`` in *step_dir* with conservative recovery settings."""
-    param = step_dir / f"{seed}.param"
-    if not param.exists():
-        return False
-
-    scf_types = {_KR_SCF, _KR_SMAX, _KR_TIMEOUT}
-    apply_scf = error_type in scf_types
-    apply_stress = error_type == _KR_STRESS
-
-    lines = param.read_text(encoding="utf-8").splitlines()
-    patched: list[str] = []
-    keys_done: set[str] = set()
-
-    for ln in lines:
-        kv = ln.split(":", 1)
-        key = kv[0].strip().lower() if len(kv) == 2 else ""
-
-        if apply_scf and key == "smearing_width":
-            patched.append("smearing_width      : 0.20 eV")
-            keys_done.add("smearing_width")
-            continue
-        if apply_scf and key == "mix_charge_amp":
-            patched.append("mix_charge_amp      : 0.05")
-            keys_done.add("mix_charge_amp")
-            continue
-        if apply_stress and key == "geom_stress_tol":
-            patched.append("geom_stress_tol     : 0.10 GPa")
-            keys_done.add("geom_stress_tol")
-            continue
-        patched.append(ln)
-
-    if apply_scf:
-        if "smearing_width" not in keys_done:
-            patched.append("smearing_width      : 0.20 eV")
-        if "mix_charge_amp" not in keys_done:
-            patched.append("mix_charge_amp      : 0.05")
-    if apply_stress and "geom_stress_tol" not in keys_done:
-        patched.append("geom_stress_tol     : 0.10 GPa")
-
-    param.write_text("\n".join(patched) + "\n", encoding="utf-8")
-    return True
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Subprocess helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -521,7 +510,7 @@ def _arm_skip() -> None:
     global _SKIP_FLAG
     _SKIP_FLAG = False
 
-    def _handler(sig: int, frame: object) -> None:
+    def _handler(sig: int, frame: Any | None) -> None:
         global _SKIP_FLAG
         _SKIP_FLAG = True
 
@@ -533,14 +522,24 @@ def _disarm_skip() -> None:
 
 
 class _Watchdog:
-    """Kill engine automatically when it stalls or exceeds the time limit."""
+    """
+    Kills the engine automatically when it stalls or exceeds the time limit.
+    Delegates health-checking completely to the engine via WatchdogCapable protocol.
+    """
 
     _POLL_S = 10.0
 
-    def __init__(self, output_file: Path, proc: "subprocess.Popen[bytes]", stop: threading.Event) -> None:
+    def __init__(
+        self,
+        output_file: Path,
+        proc: subprocess.Popen,
+        stop: threading.Event,
+        engine: BaseEngine,
+    ) -> None:
         self._file = output_file
         self._proc = proc
         self._stop = stop
+        self._engine = engine
         self.reason = ""
 
     def run(self) -> None:
@@ -551,34 +550,23 @@ class _Watchdog:
             if elapsed > config.STEP_TIMEOUT_S:
                 self.reason = _KR_TIMEOUT
                 self._kill(
-                    f"step timed out after {int(elapsed / 60)}m"
-                    f" (limit {int(config.STEP_TIMEOUT_S / 60)}m)"
+                    f"step timed out after {int(elapsed / 60)}m "
+                    f"(limit {int(config.STEP_TIMEOUT_S / 60)}m)"
                 )
                 return
 
-            if self._file.exists():
+            if self._file.exists() and isinstance(self._engine, WatchdogCapable):
                 try:
-                    text = self._file.read_text(encoding="utf-8", errors="replace")
+                    text = read_tail(self._file, max_bytes=2 * 1024 * 1024)
                 except OSError:
                     self._stop.wait(self._POLL_S)
                     continue
 
-                if "Reached maximum number of SCF cycles" in text:
-                    self.reason = _KR_SCF
-                    self._kill("max SCF cycles reached — charge sloshing likely")
+                kill_reason = self._engine.check_health(text)
+                if kill_reason:
+                    self.reason = kill_reason
+                    self._kill(f"engine health check failed: {kill_reason}")
                     return
-
-                smax = _parse_smax_history(text)
-                if len(smax) >= config.SMAX_STALL_ITERS:
-                    window = smax[-config.SMAX_STALL_ITERS:]
-                    if min(window) > config.SMAX_KILL_GPa:
-                        self.reason = _KR_SMAX
-                        self._kill(
-                            f"Smax stalled > {config.SMAX_KILL_GPa} GPa for"
-                            f" {config.SMAX_STALL_ITERS} steps"
-                            f" (last: {window[-1]:.1f} GPa)"
-                        )
-                        return
 
             self._stop.wait(self._POLL_S)
 
@@ -602,17 +590,18 @@ class ExecResult:
     kill_reason: str = ""
 
 
-def run_process(cmd: str, cwd: Path, output_file: Path, *, engine: Engine) -> ExecResult:
+def run_process(
+    cmd: str, cwd: Path, output_file: Path, *, engine: BaseEngine
+) -> ExecResult:
     """Run cmd in cwd with real-time stdout progress monitoring and watchdog."""
     stop = threading.Event()
-    proc: "subprocess.Popen[bytes] | None" = None
+    proc: subprocess.Popen | None = None
     stderr_tail: list[str] = []
     rc = -1
     watchdog: _Watchdog | None = None
 
     _arm_skip()
     try:
-        # Запускаємо процес, перехоплюємо stdout та stderr
         proc = subprocess.Popen(
             cmd,
             shell=True,
@@ -620,21 +609,19 @@ def run_process(cmd: str, cwd: Path, output_file: Path, *, engine: Engine) -> Ex
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        proc._cwd = cwd  # consumed by file-polling progress monitors (e.g. CASTEP)
+        proc._cwd = cwd  # Some engines' progress_monitor rely on this attribute
 
-        # Запускаємо прогрес-бар РУШІЯ, передаючи йому потік процесу
         monitor = threading.Thread(
             target=engine.progress_monitor, args=(proc, stop), daemon=True
         )
         monitor.start()
 
-        # Watchdog для відстеження зависань
-        watchdog = _Watchdog(output_file, proc, stop)
+        watchdog = _Watchdog(output_file, proc, stop, engine)
         wd_thread = threading.Thread(target=watchdog.run, daemon=True)
         wd_thread.start()
 
         def _drain_stderr() -> None:
-            if proc.stderr:
+            if proc is not None and proc.stderr:
                 for raw in proc.stderr:
                     line = raw.decode(errors="replace").rstrip()
                     if line:
@@ -655,7 +642,9 @@ def run_process(cmd: str, cwd: Path, output_file: Path, *, engine: Engine) -> Ex
                 except subprocess.TimeoutExpired:
                     proc.kill()
                 _disarm_skip()
-                return ExecResult(rc=None, skipped=True, stderr_tail=[], kill_reason=_KR_CTRL_C)
+                return ExecResult(
+                    rc=None, skipped=True, stderr_tail=[], kill_reason=_KR_CTRL_C
+                )
             time.sleep(0.2)
 
         drain.join(2)
@@ -664,41 +653,49 @@ def run_process(cmd: str, cwd: Path, output_file: Path, *, engine: Engine) -> Ex
         stderr_tail.append(str(e))
     finally:
         stop.set()
-        if 'monitor' in locals(): monitor.join(2)
+        if "monitor" in locals():
+            monitor.join(2)
         _disarm_skip()
         if proc and proc.poll() is None:
             proc.kill()
 
     kill_reason = watchdog.reason if watchdog else ""
-    return ExecResult(rc=rc, skipped=False, stderr_tail=stderr_tail, kill_reason=kill_reason)
-
+    return ExecResult(
+        rc=rc, skipped=False, stderr_tail=stderr_tail, kill_reason=kill_reason
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step execution  (engine-agnostic)
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def execute_step(
     state: RunState,
     step: Step,
     crystal: Crystal,
-    engine,
+    engine: BaseEngine,
     keep_all: bool = False,
 ) -> ExecResult:
     """Prepare inputs, run the engine, parse outputs, persist state."""
     x = step.concentration
     seed = state.seed
 
-    # Engine declares its own subdirectory name (e.g. CastepEngine.subdir_name = "CASTEP")
-    subdir_name = getattr(engine, "subdir_name", engine.name.upper())
-
-    base_dir = state.proj_dir / subdir_name
+    base_dir = state.proj_dir / engine.subdir_name
     base_dir.mkdir(parents=True, exist_ok=True)
     step_dir = base_dir / f"x{x:.4f}"
     step_dir.mkdir(parents=True, exist_ok=True)
-    step.step_dir = f"{subdir_name}/x{x:.4f}"
+    step.step_dir = f"{engine.subdir_name}/x{x:.4f}"
 
-    engine.write_input(step_dir, seed, crystal, state.species, x, state.template_element)
+    if state.crystal_mode not in engine.SUPPORTED_MODES:
+        raise IncompatibleMode(
+            f"{engine.name} does not support '{state.crystal_mode}' mode. "
+            f"Supported: {engine.SUPPORTED_MODES}"
+        )
+
+    engine.write_input(
+        step_dir, seed, crystal, state.species, x, state.template_element
+    )
 
     step.status = RUNNING
     step.started_at = _now()
@@ -734,19 +731,16 @@ def execute_step(
         extra = result_dict.pop("extra_data", {})
 
         clean_dict = {k: v for k, v in result_dict.items() if v is not None}
-        clean_dict.update(extra)  # Flatten custom engine metrics into the root
+        clean_dict.update(extra)
 
-        # Normalise run_time_s → wall_time_s (Step.wall_time_s property reads this key)
         if "run_time_s" in clean_dict and "wall_time_s" not in clean_dict:
             clean_dict["wall_time_s"] = clean_dict["run_time_s"]
 
         step.parsed.update(clean_dict)
 
-        # Engine-specific post-parse hook (e.g. CASTEP .elastic file)
-        if hasattr(engine, "parse_extra_outputs"):
-            extra = engine.parse_extra_outputs(step_dir, seed)
-            if extra:
-                step.parsed.update(extra)
+        extra_out = engine.parse_extra_outputs(step_dir, seed)
+        if extra_out:
+            step.parsed.update(extra_out)
 
         if result.kill_reason:
             step.parsed["kill_reason"] = result.kill_reason
@@ -762,39 +756,45 @@ def execute_step(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Elastic workflow — capability-based routing
+# Elastic workflow — capability-based routing via isinstance()
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def run_elastic_for_step(
     state: RunState,
     step: Step,
-    engine,
+    engine: BaseEngine,
 ) -> dict[str, str]:
-    """Route elastic calculation based on engine capabilities.
-
-    - If engine has ``run_internal_elastic``: delegate entirely.
-    - Otherwise: finite-strain loop driven by orchestrator.
-    """
+    """Route elastic calculation based on engine capabilities."""
     step_dir = state.proj_dir / step.step_dir
     seed = state.seed
     x = step.concentration
     density = float(step.parsed.get("density_gcm3") or 0) or None
     volume = float(step.parsed.get("volume_ang3") or 0) or None
 
-    if hasattr(engine, "run_internal_elastic"):
-        return engine.run_internal_elastic(
-            step_dir, seed, x, state.species,
-            state.nonmetal or None, density, volume,
+    if isinstance(engine, ElasticCapable):
+        result = engine.run_elastic(
+            step_dir,
+            seed,
+            x,
+            state.species,
+            state.nonmetal or None,
+            density,
+            volume,
         )
+        if "_elastic_error" in result and "Born" in result.get("_elastic_error", ""):
+            result.setdefault("born_stable", "False")
+        return result
 
-    # ── Finite-strain fallback ────────────────────────────────────────────────
-    return _finite_strain_elastic(state, step, engine, step_dir, seed, x, density, volume)
+    return _finite_strain_elastic(
+        state, step, engine, step_dir, seed, x, density, volume
+    )
 
 
 def _finite_strain_elastic(
     state: RunState,
     step: Step,
-    engine,
+    engine: BaseEngine,
     step_dir: Path,
     seed: str,
     x: float,
@@ -802,17 +802,13 @@ def _finite_strain_elastic(
     volume_ang3: float | None,
 ) -> dict[str, str]:
     import numpy as np
-    from core_physics import generate_strain_steps, fit_cij_cubic
+    from core_physics import fit_cij_cubic, generate_strain_steps
 
-    if not (
-        hasattr(engine, "write_singlepoint_input")
-        and hasattr(engine, "parse_stress_tensor")
-        and hasattr(engine, "load_optimised_crystal")
-    ):
+    if not isinstance(engine, FiniteStrainCapable):
         return {
             "_elastic_error": (
-                "Engine does not support finite-strain fallback — "
-                "missing write_singlepoint_input / parse_stress_tensor / load_optimised_crystal"
+                f"{engine.name} supports neither ElasticCapable nor FiniteStrainCapable — "
+                "cannot compute elastic constants."
             )
         }
 
@@ -823,8 +819,6 @@ def _finite_strain_elastic(
     except (FileNotFoundError, ValueError) as exc:
         return {"_elastic_error": f"load_optimised_crystal failed: {exc}"}
 
-    # generate_strain_steps uses crystal.strain_pattern_code (from spglib) and
-    # handles cubic → conventional cell conversion internally.
     strain_steps = generate_strain_steps(
         opt_crystal,
         max_strain=config.ELASTIC_MAX_STRAIN,
@@ -864,7 +858,9 @@ def _finite_strain_elastic(
         strains.append(ss.strain_voigt)
 
     if len(stresses) < 3:
-        error_detail = "; ".join(step_errors) if step_errors else "no step errors recorded"
+        error_detail = (
+            "; ".join(step_errors) if step_errors else "no step errors recorded"
+        )
         return {
             "_elastic_error": (
                 f"Not enough stress tensors ({len(stresses)}/{len(strain_steps)}). "
@@ -873,19 +869,23 @@ def _finite_strain_elastic(
         }
 
     result = fit_cij_cubic(
-        stresses, strains,
+        stresses,
+        strains,
         density_gcm3=density_gcm3,
         n_atoms=opt_crystal.num_atoms,
         volume_ang3=volume_ang3,
     )
     result["elastic_wall_time_s"] = f"{time.monotonic() - t0:.0f}"
-    result["elastic_source"] = f"{engine.name.upper()}-FiniteStrain-{opt_crystal.lattice_type}"
+    result["elastic_source"] = (
+        f"{engine.name.upper()}-FiniteStrain-{opt_crystal.lattice_type}"
+    )
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")

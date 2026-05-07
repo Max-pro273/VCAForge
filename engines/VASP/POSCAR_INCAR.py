@@ -1,7 +1,7 @@
 """
 VASP/POSCAR_INCAR.py  —  VASP File I/O and Parsing.
 ════════════════════════════════════════════════════════════════
-Pure functions for generating POSCAR, POTCAR, INCAR, KPOINTS,
+Pure functions for generating POSCAR, INCAR, KPOINTS,
 and parsing OUTCAR. No state, no subprocesses.
 """
 
@@ -10,15 +10,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import numpy as np
-
 import config as _cfg
+import numpy as np
 from core_physics import Crystal
 from engines.engine import EngineResult, _try_float, read_tail
 
-# ─────────────────────────────────────────────────────────────────────────────
-# POSCAR Generator
-# ─────────────────────────────────────────────────────────────────────────────
 
 def write_vca_poscar(
     dest: Path,
@@ -26,11 +22,6 @@ def write_vca_poscar(
     template_element: str,
     target_mix: dict[str, float],
 ) -> tuple[list[str], list[float]]:
-    """Write VASP POSCAR for a VCA calculation.
-
-    Vegard scaling must be applied by the caller via core_physics.apply_vegard_scaling
-    before passing crystal here.
-    """
     L = crystal.lattice.copy()
     eps = 1e-8
     nonzero_mix = {e: f for e, f in target_mix.items() if f > eps}
@@ -63,7 +54,7 @@ def write_vca_poscar(
 
     lines = [
         f"VCAForge mix={list(nonzero_mix.keys())} tmpl={template_element}",
-        "1.00000000000000"
+        "1.00000000000000",
     ]
     for vec in L:
         lines.append(f"  {vec[0]:20.15f}  {vec[1]:20.15f}  {vec[2]:20.15f}")
@@ -78,9 +69,6 @@ def write_vca_poscar(
     dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ordered_elements, vca_weights
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INCAR Generator
-# ─────────────────────────────────────────────────────────────────────────────
 
 def write_engine_params(
     path: Path,
@@ -96,7 +84,12 @@ def write_engine_params(
 ) -> None:
     is_geom = task_type == "GeometryOptimization"
     is_elastic = task_type in ("ElasticConstants", "ElasticIBRION6")
-    ediff = _cfg.EDIFF_GEOM if is_geom else _cfg.EDIFF_IBRION6
+
+    ediff = (
+        getattr(_cfg, "EDIFF_GEOM", "1E-5")
+        if is_geom
+        else getattr(_cfg, "EDIFF_IBRION6", "1E-7")
+    )
 
     lines = [
         f"# VCAForge INCAR - Task: {task_type}",
@@ -105,7 +98,7 @@ def write_engine_params(
         "LREAL  = Auto",
         f"ENCUT  = {cutoff}",
         f"EDIFF  = {ediff}",
-        f"ISMEAR = {_cfg.ISMEAR}",
+        f"ISMEAR = {getattr(_cfg, 'ISMEAR', 1)}",
         f"SIGMA  = {smearing:.4f}",
         f"ISPIN  = {2 if spin else 1}",
         "LWAVE  = .FALSE.",
@@ -118,150 +111,71 @@ def write_engine_params(
         lines.append(f"NELECT = {nelect:.4f}")
 
     if is_geom:
-        lines.extend([
-            f"IBRION = {_cfg.IBRION_GEOM}",
-            f"ISIF   = {_cfg.ISIF}",
-            f"NSW    = {_cfg.NSW_MAX_VASP}",
-            f"EDIFFG = {_cfg.EDIFFG_VASP}",
-        ])
+        lines.extend(
+            [
+                f"IBRION = {getattr(_cfg, 'IBRION_GEOM', 2)}",
+                f"ISIF   = {getattr(_cfg, 'ISIF', 3)}",
+                f"NSW    = {getattr(_cfg, 'NSW_MAX_VASP', 300)}",
+                f"EDIFFG = {getattr(_cfg, 'EDIFFG_VASP', '-0.01')}",
+            ]
+        )
         if ncore > 0:
             lines.append(f"NCORE  = {ncore}")
     elif is_elastic:
-        lines.extend([
-            "IBRION = 6",
-            "ISIF   = 3",
-            "NSW    = 1",
-            "POTIM  = 0.015",
-            "NFREE  = 2",
-        ])
+        lines.extend(
+            [
+                "IBRION = 6",
+                "ISIF   = 3",
+                "NSW    = 1",
+                "POTIM  = 0.015",
+                "NFREE  = 2",
+            ]
+        )
     else:
-        lines.extend([
-            "IBRION = -1",
-            "NSW    = 0",
-        ])
+        lines.extend(["IBRION = -1", "NSW    = 0"])
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# OUTCAR Parsers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_outcar(path: Path) -> EngineResult:
-    """
-    Parses the VASP OUTCAR file from the bottom up to extract final physical metrics.
-    Includes advanced telemetry: Fermi energy, Max Force, Pressure, and Peak Memory.
-    """
+    r = EngineResult()
     if not path.exists():
-        return EngineResult(warning="OUTCAR not found")
+        r.warning = "OUTCAR not found"
+        return r
 
-    text = read_tail(path, max_bytes=3 * 1024 * 1024)
-    extra_data = {}
+    text = read_tail(path, max_bytes=5 * 1024 * 1024)
+    lines = text.splitlines()
 
-    # 1. Convergence Status
-    if "reached required accuracy" in text.lower():
-        extra_data["geom_converged"] = "yes"
-    else:
-        extra_data["geom_converged"] = "no"
+    la = lb = lc = None
 
-    # 2. Lattice Parameters (a, b, c)
-    m_lat = re.findall(
-        r"length of vectors\s*\n\s*([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)",
-        text
-    )
-    if m_lat:
-        a, b, c = m_lat[-1]
-        extra_data["a_opt_ang"] = _try_float(a)
-        extra_data["b_opt_ang"] = _try_float(b)
-        extra_data["c_opt_ang"] = _try_float(c)
+    for i, line in enumerate(reversed(lines)):
+        s = line.strip()
 
-    # 3. Volume
-    m_vol = re.findall(r"volume of cell :\s*([-\d.]+)", text)
-    volume_ang3 = _try_float(m_vol[-1]) if m_vol else None
+        if not r.geom_converged and "Reached required accuracy" in line:
+            r.geom_converged = True
 
-    # 4. Energies (TOTEN and Sigma->0)
-    m_energy = re.findall(r"free\s+energy\s+TOTEN\s*=\s*([-\d.]+)\s*eV", text)
-    energy_ev = None
-    if m_energy:
-        energy_ev = _try_float(m_energy[-1])
-        # Map TOTEN to enthalpy/free_energy for orchestrator compatibility
-        extra_data["enthalpy_eV"] = energy_ev
-        extra_data["free_energy_ev"] = energy_ev
+        if r.enthalpy_eV is None and "free  energy   TOTEN" in line:
+            r.enthalpy_eV = _try_float(line.split("=")[-1].strip().split()[0])
+            r.energy_ev = r.enthalpy_eV
 
-    m_e0 = re.findall(r"energy\(sigma->0\)\s*=\s*([-\d.]+)", text)
-    if m_e0:
-        extra_data["energy_0k_ev"] = _try_float(m_e0[-1])
+        if r.volume_ang3 is None and "volume of cell :" in line:
+            r.volume_ang3 = _try_float(line.split(":")[1].strip().split()[0])
 
-    # 5. Fermi Energy
-    m_fermi = re.findall(r"E-fermi\s*:\s*([-\d.]+)", text)
-    if m_fermi:
-        extra_data["fermi_ev"] = _try_float(m_fermi[-1])
+        if la is None and "length of vectors" in line:
+            try:
+                parts = lines[len(lines) - 1 - i + 1].split()
+                if len(parts) >= 3:
+                    la, lb, lc = (
+                        _try_float(parts[0]),
+                        _try_float(parts[1]),
+                        _try_float(parts[2]),
+                    )
+                    if la and lb and lc:
+                        r.a_opt_ang, r.b_opt_ang, r.c_opt_ang = la, lb, lc
+            except IndexError:
+                pass
 
-    # 6. Residual Pressure (Convert kB to GPa)
-    m_press = re.findall(r"external pressure\s*=\s*([-\d.]+)\s*kB", text)
-    if m_press:
-        p_kb = _try_float(m_press[-1])
-        if p_kb is not None:
-            extra_data["residual_pressure_GPa"] = round(p_kb * 0.1, 4)
+        if r.run_time_s is None and "Elapsed time" in line:
+            r.run_time_s = _try_float(line.split(":")[-1].strip())
 
-    # 7. Magnetization (if ISPIN = 2)
-    m_mag = re.findall(r"number of electron\s+[\d.]+\s+magnetization\s+([-\d.]+)", text)
-    if m_mag:
-        extra_data["mag_moment"] = _try_float(m_mag[-1])
-
-    # 8. Maximum Force (Calculate vector norm from the last iteration)
-    force_blocks = re.findall(
-        r"POSITION\s+TOTAL-FORCE \(eV/Angst\)\s*\n\s*-+\n(.*?)\n\s*-+\n\s*total drift",
-        text, re.DOTALL
-    )
-    if force_blocks:
-        last_block = force_blocks[-1]
-        fmax = 0.0
-        for line in last_block.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 6:
-                try:
-                    fx, fy, fz = float(parts[3]), float(parts[4]), float(parts[5])
-                    fnorm = (fx**2 + fy**2 + fz**2)**0.5
-                    if fnorm > fmax:
-                        fmax = fnorm
-                except ValueError:
-                    pass
-        extra_data["fmax_ev_ang"] = round(fmax, 6)
-
-    # 9. Wall Time and Peak Memory
-    m_time = re.search(r"Elapsed time\s*\(sec\):\s*([-\d.]+)", text)
-    run_time_s = _try_float(m_time.group(1)) if m_time else None
-
-    m_mem = re.search(r"Maximum memory used \(kb\):\s*([-\d.]+)", text)
-    if m_mem:
-        mem_kb = _try_float(m_mem.group(1))
-        if mem_kb is not None:
-            extra_data["peak_mem_mb"] = round(mem_kb / 1024.0, 1)
-
-    return EngineResult(
-        energy_ev=energy_ev,
-        volume_ang3=volume_ang3,
-        run_time_s=run_time_s,
-        extra_data=extra_data,
-        warning=None if energy_ev else "Final energy not found. SCF failed?"
-    )
-
-
-def parse_ibrion6_tensor(outcar: Path) -> np.ndarray | None:
-    if not outcar.exists(): return None
-    text = read_tail(outcar, max_bytes=2 * 1024 * 1024)
-
-    m = re.search(r"TOTAL ELASTIC MODULI \(kBar\)\s+Direction[^\n]+\n[^\n]+\n(.*?)(?:\n\s*\n|---)", text, re.DOTALL)
-    if not m: return None
-
-    rows = []
-    for line in m.group(1).splitlines():
-        parts = line.split()
-        if len(parts) >= 7:
-            try: rows.append([float(x) for x in parts[1:7]])
-            except ValueError: pass
-
-    if len(rows) >= 6:
-        C_kbar = np.array(rows[:6])
-        return C_kbar / 10.0
-    return None
+    return r

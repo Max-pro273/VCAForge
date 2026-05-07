@@ -7,6 +7,7 @@ Elastic strategy: finite-strain fallback driven by orchestrator.
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import shutil
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import config as _cfg
 import numpy as np
-from core_physics import Crystal, apply_vegard_scaling, load_crystal, nextra_bands_for
+from core_physics import Crystal, load_crystal
 from engines.CASTEP.cell_param import (
     parse_elastic_file,
     parse_output,
@@ -25,218 +26,157 @@ from engines.CASTEP.cell_param import (
     write_engine_params,
     write_vca_cell,
 )
-from engines.engine import EngineResult, read_tail, register_engine
+from engines.engine import (
+    BaseEngine,
+    EngineResult,
+    FiniteStrainCapable,
+    RecoveryCapable,
+    WatchdogCapable,
+    read_tail,
+    register_engine,
+)
+
+# Kill-reason constants
+_KR_SCF = "scf_nosconv"
+_KR_SMAX = "smax_stall"
+_KR_TIMEOUT = "timeout"
+_KR_STRESS = "geom_high_stress"
 
 
-def _species_vec(species_mix: list[tuple[str, float]]) -> float:
-    from core_physics import vec_for_system
-    return vec_for_system(species_mix)
+def parse_smax_history(text: str) -> list[float]:
+    """Parse Smax (GPa) history from CASTEP LBFGS convergence lines."""
+    smax: list[float] = []
+    for ln in text.splitlines():
+        if "Smax" in ln and "<-- LBFGS" in ln:
+            parts = ln.split("|")
+            if len(parts) >= 4:
+                try:
+                    smax.append(float(parts[2].strip()))
+                except ValueError:
+                    pass
+    return smax
 
-def _wizard_engine_cmd(override_cmd: str | None) -> str:
-    import glob
 
-    import ui
-    if override_cmd:
-        return override_cmd
-
-    cpu = os.cpu_count() or 4
-    ui.section("Engine execution (CASTEP)")
-
-    bin_path = None
-    # Smart discovery using config paths
-    for pat in _cfg.CASTEP_SEARCH_PATHS:
-        # Check standard PATH first
-        if pat in ("castep.mpi", "castep"):
-            w = shutil.which(pat)
-            if w:
-                bin_path = w
-                break
-        else:
-            # Glob search for absolute/relative paths
-            expanded = os.path.expanduser(pat)
-            matches = glob.glob(expanded, recursive=True)
-            for m in matches:
-                if os.path.isfile(m) and os.access(m, os.X_OK):
-                    bin_path = m
-                    break
-        if bin_path: break
-
-    if not bin_path:
-        print("  ⚠  CASTEP executable not found automatically.")
-        ans = ui.ask_str("  Provide absolute path to castep.mpi (or 'skip'): ").strip()
-        if ans.lower() == "skip":
-            return ""
-        bin_path = os.path.expanduser(ans)
-    else:
-        print(f"  ✓  Found executable: {bin_path}")
-
-    raw = ui.ask_str(f"  MPI processes [{cpu}]: ", str(cpu))
-    try:
-        n = max(1, int(raw))
-    except ValueError:
-        n = cpu
-
-    name = Path(bin_path).name
-    cmd = f"mpirun -n {n} {bin_path} {{seed}}" if "mpi" in name.lower() else f"{bin_path} {{seed}}"
-    return cmd
-
-def _wizard_param(src_file: Path, crystal: Crystal, species_list: list[str], is_vca: bool) -> Path:
-    import ui
-    param_path = src_file.with_suffix(".param")
-    if param_path.exists():
-        print(f"  .param : {param_path.name}  (found)")
-        return param_path
-
-    schema = CastepEngine.get_wizard_schema(crystal, is_vca)
-    ui.section("Parameter setup (CASTEP)")
-    answers = ui.render_wizard(schema)
-
-    # We use a simple heuristic for nextra bands during initial setup
-    has_d = any(_cfg.ELEMENTS.get(s.capitalize(), {}).get("Z", 0) > 20 for s in species_list)
-    nextra = (20 if has_d else 10) if is_vca else 10
-
-    write_engine_params(
-        param_path,
-        task_type=answers["task"],
-        xc=answers["xc"],
-        cutoff=answers["cutoff"],
-        spin=answers["spin"],
-        nextra=nextra,
-        smearing=answers["smearing"],
-    )
-    return param_path
+def _nextra_bands(x: float, vec: float) -> int:
+    """Extra bands for elastic SCF."""
+    if x < 1e-5 or x > 1.0 - 1e-5:
+        return getattr(_cfg, "ELASTIC_NEXTRA_PURE", 10)
+    return getattr(_cfg, "ELASTIC_NEXTRA_BASE", 15) + int(abs(vec - 8.0) * 20)
 
 
 @register_engine("castep")
-class CastepEngine:
+class CastepEngine(BaseEngine):
     """CASTEP DFT engine — finite-strain elastic fallback."""
 
-    name: str = "castep"
-    output_suffix: str = ".castep"
-    subdir_name: str = _cfg.CASTEP_SUBDIR
-    _cleanup_globs = _cfg.CASTEP_CLEANUP_GLOBS
+    name = "castep"
+    output_suffix = ".castep"
+    subdir_name = _cfg.CASTEP_SUBDIR
+    SUPPORTED_MODES = frozenset({"vca", "sqs", "direct"})
+    _cleanup_globs = getattr(_cfg, "CASTEP_CLEANUP_GLOBS", [])
 
     def __init__(self, engine_cmd: str, param_src: Path | str) -> None:
         self.engine_cmd = engine_cmd
         self.param_src = Path(param_src)
+
+    # ── Setup ─────────────────────────────────────────────────────────────────
 
     @classmethod
     def setup_interactive(
         cls,
         src: Path,
         crystal: Crystal,
-        override_cmd: str | None = None,
+        override_cmd: str | None,
+        args: argparse.Namespace,
     ) -> tuple["CastepEngine", str]:
-        species_list = list(dict.fromkeys(crystal.species))
-        param_src = _wizard_param(src, crystal, species_list, is_vca=True)
-        engine_cmd = _wizard_engine_cmd(override_cmd)
-        return cls(engine_cmd, param_src), engine_cmd
+        import ui
 
-    def write_input(
-        self,
-        dest_dir: Path,
-        seed: str,
-        crystal: Crystal,
-        species_mix: list[tuple[str, float]],
-        x: float,
-        template_element: str,
-    ) -> None:
-        target_mix = {species_mix[0][0]: 1.0 - x}
-        for e, f in species_mix[1:]:
-            target_mix[e] = f * x
+        cpu = os.cpu_count() or 4
+        ui.section("Engine execution (CASTEP)")
 
-        scaled = apply_vegard_scaling(crystal, template_element, target_mix)
-        write_vca_cell(dest_dir / f"{seed}.cell", scaled, template_element, target_mix)
-        dest_param = dest_dir / f"{seed}.param"
-        shutil.copy2(self.param_src, dest_param)
-        patch_nextra(dest_param, nextra_bands_for(x, _species_vec(species_mix)))
+        # Find binary using the unified BaseEngine method
+        bin_path = (
+            override_cmd
+            if override_cmd
+            else cls.find_resource(_cfg.CASTEP_SEARCH_PATHS, must_be_executable=True)
+        )
 
-    def parse_output(self, output_file: Path) -> EngineResult:
-        return parse_output(output_file)
+        while not bin_path:
+            print("  ⚠  CASTEP executable not found automatically.")
+            ans = ui.ask_str(
+                "  Provide absolute path to castep.mpi (or 'skip'): "
+            ).strip()
+            if ans.lower() == "skip":
+                bin_path = ""
+                break
+            bin_path = os.path.expanduser(ans)
 
-    def parse_extra_outputs(self, step_dir: Path, seed: str) -> dict:
-        ep = step_dir / f"{seed}.elastic"
-        return parse_elastic_file(ep) if ep.exists() else {}
+        if bin_path:
+            print(f"  ✓  Found executable: {bin_path}")
 
-    def progress_monitor(self, proc: subprocess.Popen, stop: threading.Event) -> None:
-        if proc.stdout is not None:
-            threading.Thread(target=lambda: [_ for _ in iter(proc.stdout.readline, b"")], daemon=True).start()
-
-        cwd_path: Path | None = getattr(proc, "_cwd", None)
-        t0 = time.time()
-        geo, geo_seen = 0, 0
-        scf, scf_seen = 0, 0
-        last_size = 0
-        castep_file: Path | None = None
-
-        def _render() -> None:
-            scf_denom = max(scf_seen + 2, 5)
-            pct = min(100, int(scf * 100 / scf_denom))
-            filled = pct * 30 // 100
-            bar = "█" * filled + "░" * (30 - filled)
-            el = int(time.time() - t0)
-            mm, ss_v = divmod(el, 60)
-            scf_str = f"{scf}/{scf_seen}" if scf_seen >= 1 else f"{scf}/—"
-            print(f"\r  │  [{bar}] {pct:3d}%  geo {geo}  scf {scf_str}  ⏱ {mm:02d}:{ss_v:02d}    ", end="", flush=True)
-
-        if cwd_path is not None:
-            deadline = time.monotonic() + 15.0
-            while not stop.is_set() and time.monotonic() < deadline:
-                candidates = list(cwd_path.glob("*.castep"))
-                if candidates:
-                    castep_file = max(candidates, key=lambda p: p.stat().st_mtime)
-                    break
-                time.sleep(0.5)
-
-        while not stop.is_set():
-            if castep_file is None or not castep_file.exists():
-                _render()
-                time.sleep(1.0)
-                continue
-
+        cores = getattr(args, "cores", None)
+        if cores is not None:
+            n = max(1, cores)
+            print(f"  MPI processes : {n}  (from --cores)")
+        else:
+            raw = ui.ask_str(f"  MPI processes [{cpu}]: ", str(cpu))
             try:
-                size = castep_file.stat().st_size
-                if size == last_size:
-                    _render()
-                    time.sleep(0.8)
-                    continue
+                n = max(1, int(raw))
+            except ValueError:
+                n = cpu
 
-                # MEMORY FIX: Only read the last 2MB to prevent RAM crashes on long runs
-                text = read_tail(castep_file, max_bytes=2 * 1024 * 1024)
-                last_size = size
+        cmd = ""
+        if bin_path:
+            name = Path(bin_path).name
+            cmd = (
+                f"mpirun -n {n} {bin_path} {{seed}}"
+                if "mpi" in name.lower()
+                else f"{bin_path} {{seed}}"
+            )
 
-                for line in text.splitlines():
-                    if "LBFGS: finished iteration" in line:
-                        parts = line.split()
-                        try:
-                            geo = int(parts[parts.index("iteration") + 1])
-                            geo_seen = max(geo_seen, geo)
-                            scf = 0
-                        except (ValueError, IndexError): pass
-                    elif "<-- SCF" in line:
-                        s = line.lstrip()
-                        if s and s[0].isdigit():
-                            try:
-                                scf = int(s.split()[0])
-                                scf_seen = max(scf_seen, scf)
-                            except ValueError: pass
-                _render()
-                time.sleep(0.8)
-            except FileNotFoundError:
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"\n  [Monitor Error] {e}")
-                time.sleep(1.0)
+        # Build .param
+        species_list = list(dict.fromkeys(crystal.species))
+        param_src = src.with_suffix(".param")
+        if not param_src.exists():
+            schema = cls.get_wizard_schema(crystal, is_vca=True)
+            ui.section("Parameter setup (CASTEP)")
+            answers = ui.render_wizard(schema)
 
-        print("\r" + " " * 90, end="\r", flush=True)
+            has_d = any(
+                _cfg.ELEMENTS.get(s.capitalize(), {}).get("Z", 0) > 20
+                for s in species_list
+            )
+            nextra = 20 if has_d else 10
+
+            write_engine_params(
+                param_src,
+                task_type=answers["task"],
+                xc=answers["xc"],
+                cutoff=answers["cutoff"],
+                spin=answers["spin"],
+                nextra=nextra,
+                smearing=answers["smearing"],
+            )
+            print(f"\n  ✓ Written: {param_src.name}")
+        else:
+            print(f"  .param : {param_src.name}  (found)")
+
+        return cls(cmd, param_src), cmd
+
+    # ── Wizard Schema ─────────────────────────────────────────────────────────
 
     @classmethod
     def get_wizard_schema(cls, crystal: Crystal, is_vca: bool) -> list[dict]:
         species = list(dict.fromkeys(crystal.species))
-        has_hard = any(_cfg.ELEMENTS.get(s.capitalize(), {}).get("hard", False) for s in species)
-        has_mag = any(_cfg.ELEMENTS.get(s.capitalize(), {}).get("mag", False) for s in species)
+        has_hard = any(
+            _cfg.ELEMENTS.get(s.capitalize(), {}).get("hard", False) for s in species
+        )
+        has_mag = any(
+            _cfg.ELEMENTS.get(s.capitalize(), {}).get("mag", False) for s in species
+        )
         rec_cut = _cfg.ENCUT_HARD if has_hard else _cfg.ENCUT_SOFT
-        rec_smear = _cfg.SMEARING_VCA if is_vca else _cfg.SMEARING_SINGLE
+        rec_smear = (
+            _cfg.SMEARING_VCA if is_vca else getattr(_cfg, "SMEARING_SINGLE", 0.10)
+        )
 
         return [
             {
@@ -278,8 +218,119 @@ class CastepEngine:
             },
         ]
 
+    # ── Core Engine Methods ───────────────────────────────────────────────────
+
+    def write_input(
+        self,
+        dest_dir: Path,
+        seed: str,
+        crystal: Crystal,
+        species_mix: list[tuple[str, float]],
+        x: float,
+        template_element: str,
+    ) -> None:
+        target_mix = {species_mix[0][0]: 1.0 - x}
+        for e, f in species_mix[1:]:
+            target_mix[e] = f * x
+
+        scaled = crystal.with_vegard(template_element, target_mix)
+        write_vca_cell(dest_dir / f"{seed}.cell", scaled, template_element, target_mix)
+        dest_param = dest_dir / f"{seed}.param"
+        shutil.copy2(self.param_src, dest_param)
+        patch_nextra(dest_param, _nextra_bands(x, crystal.vec(species_mix)))
+
+    def parse_output(self, output_file: Path) -> EngineResult:
+        return parse_output(output_file)
+
+    def parse_extra_outputs(self, step_dir: Path, seed: str) -> dict:
+        ep = step_dir / f"{seed}.elastic"
+        return parse_elastic_file(ep) if ep.exists() else {}
+
+    # ── WatchdogCapable ───────────────────────────────────────────────────────
+
+    def check_health(self, log_tail: str) -> str | None:
+        """Analyzes CASTEP output tail. Returns a kill reason if stalled/dead."""
+        if "Reached maximum number of SCF cycles" in log_tail:
+            return _KR_SCF
+        smax = parse_smax_history(log_tail)
+        if len(smax) >= getattr(_cfg, "SMAX_STALL_ITERS", 8):
+            window = smax[-getattr(_cfg, "SMAX_STALL_ITERS", 8) :]
+            if min(window) > getattr(_cfg, "SMAX_KILL_GPa", 50.0):
+                return _KR_SMAX
+        return None
+
+    # ── RecoveryCapable ───────────────────────────────────────────────────────
+
+    def patch_for_recovery(self, step_dir: Path, seed: str, error_type: str) -> bool:
+        param = step_dir / f"{seed}.param"
+        if not param.exists():
+            return False
+
+        apply_scf = error_type in {_KR_SCF, _KR_SMAX, _KR_TIMEOUT}
+        apply_stress = error_type == _KR_STRESS
+
+        lines = param.read_text(encoding="utf-8").splitlines()
+        patched: list[str] = []
+        keys_done: set[str] = set()
+
+        for ln in lines:
+            kv = ln.split(":", 1)
+            key = kv[0].strip().lower() if len(kv) == 2 else ""
+
+            if apply_scf and key == "smearing_width":
+                patched.append("smearing_width      : 0.20 eV")
+                keys_done.add("smearing_width")
+                continue
+            if apply_scf and key == "mix_charge_amp":
+                patched.append("mix_charge_amp      : 0.05")
+                keys_done.add("mix_charge_amp")
+                continue
+            if apply_stress and key == "geom_stress_tol":
+                patched.append("geom_stress_tol     : 0.10 GPa")
+                keys_done.add("geom_stress_tol")
+                continue
+            patched.append(ln)
+
+        if apply_scf:
+            if "smearing_width" not in keys_done:
+                patched.append("smearing_width      : 0.20 eV")
+            if "mix_charge_amp" not in keys_done:
+                patched.append("mix_charge_amp      : 0.05")
+        if apply_stress and "geom_stress_tol" not in keys_done:
+            patched.append("geom_stress_tol     : 0.10 GPa")
+
+        param.write_text("\n".join(patched) + "\n", encoding="utf-8")
+        return True
+
+    def retry_schema(self) -> list[dict]:
+        return [
+            {
+                "kill_reason": _KR_SCF,
+                "description": "SCF did not converge.",
+                "fix": "Increased smearing, reduced mix_amp.",
+            },
+            {
+                "kill_reason": _KR_SMAX,
+                "description": "Geom opt stalled at high stress.",
+                "fix": "Increased smearing, reduced mix_amp.",
+            },
+            {
+                "kill_reason": _KR_TIMEOUT,
+                "description": "Step timed out.",
+                "fix": "Increased smearing, reduced mix_amp.",
+            },
+            {
+                "kill_reason": _KR_STRESS,
+                "description": "Residual stress too high for elastic.",
+                "fix": "Relaxed geom_stress_tol to 0.10 GPa.",
+            },
+        ]
+
+    # ── FiniteStrainCapable ───────────────────────────────────────────────────
+
     def load_optimised_crystal(self, step_dir: Path, seed: str) -> Crystal:
         from core_physics import _read_raw
+
         orig_cell = step_dir / f"{seed}.cell"
         out_cell = step_dir / f"{seed}-out.cell"
 
@@ -291,7 +342,7 @@ class CastepEngine:
         if out_cell.exists():
             relaxed = _read_raw(out_cell)
             crystal.lattice = relaxed.lattice
-            crystal.clear_cache() # Safe symmetric reset
+            crystal.clear_cache()
         else:
             print(f"\n  [Warning] {out_cell.name} not found — using unrelaxed lattice.")
 
@@ -316,11 +367,13 @@ class CastepEngine:
 
         e11, e22, e33 = strain_voigt[0], strain_voigt[1], strain_voigt[2]
         e23, e13, e12 = strain_voigt[3] / 2, strain_voigt[4] / 2, strain_voigt[5] / 2
-        F = np.array([
-            [1 + e11,   e12,   e13],
-            [   e12, 1 + e22,  e23],
-            [   e13,   e23, 1 + e33],
-        ])
+        F = np.array(
+            [
+                [1 + e11, e12, e13],
+                [e12, 1 + e22, e23],
+                [e13, e23, 1 + e33],
+            ]
+        )
 
         strained_crystal = Crystal(
             lattice=crystal.lattice @ F.T,
@@ -333,7 +386,7 @@ class CastepEngine:
             strained_crystal,
             tmpl_elem,
             target_mix,
-            vegard=False # Vegard already applied to base relaxed cell
+            vegard=False,
         )
 
         param_text = self.param_src.read_text(encoding="utf-8", errors="replace")
@@ -341,7 +394,9 @@ class CastepEngine:
         m_cut = re.search(r"cut_off_energy\s*:\s*(\d+)", param_text, re.I)
 
         if not m_xc or not m_cut:
-            raise ValueError(f"Missing xc_functional or cut_off_energy in {self.param_src}")
+            raise ValueError(
+                f"Missing xc_functional or cut_off_energy in {self.param_src}"
+            )
 
         write_engine_params(
             dest_dir / f"{seed}.param",
@@ -349,8 +404,8 @@ class CastepEngine:
             xc=m_xc.group(1),
             cutoff=int(m_cut.group(1)),
             spin=False,
-            nextra=nextra_bands_for(x, _species_vec(species_mix)),
-            smearing=_cfg.SMEARING_SINGLE,
+            nextra=_nextra_bands(x, crystal.vec(species_mix)),
+            smearing=getattr(_cfg, "SMEARING_SINGLE", 0.1),
         )
 
     def parse_stress_tensor(self, output_file: Path) -> np.ndarray:
@@ -359,43 +414,112 @@ class CastepEngine:
 
         text = read_tail(output_file, max_bytes=2 * 1024 * 1024)
 
-        # Format 1 — GeomOpt: three rows with scientific notation ending in "<-- S"
-        #   -1.234567E+002  0.000000E+000  0.000000E+000  <-- S
         geomopt_blocks = re.findall(
             r"^\s*([-+]?\d+\.\d+[Ee][+-]?\d+)\s+"
             r"([-+]?\d+\.\d+[Ee][+-]?\d+)\s+"
             r"([-+]?\d+\.\d+[Ee][+-]?\d+)\s+<-- S",
-            text, re.M,
+            text,
+            re.M,
         )
         if len(geomopt_blocks) >= 3:
             m = np.array([[float(v) for v in r] for r in geomopt_blocks[-3:]])
             return np.array([m[0, 0], m[1, 1], m[2, 2], m[1, 2], m[0, 2], m[0, 1]])
 
-        # Format 2 — SinglePoint: rows inside the "Symmetrised Stress Tensor" box
-        #  *  x      0.046525      0.000000      0.000000  *
-        #  *  y      0.000000      0.046525     -0.000000  *
-        #  *  z      0.000000     -0.000000      0.046525  *
-        # Take the LAST such block in the file (final SCF).
         sp_blocks = re.findall(
             r"Symmetrised Stress Tensor.*?"
             r"\*\s+x\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*\*\s*"
             r"\*\s+y\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*\*\s*"
             r"\*\s+z\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*\*",
-            text, re.S,
+            text,
+            re.S,
         )
         if sp_blocks:
-            v = [float(x) for x in sp_blocks[-1]]
-            # v = [xx, xy, xz, yx, yy, yz, zx, zy, zz]
+            v = [float(val) for val in sp_blocks[-1]]
             return np.array([v[0], v[4], v[8], v[5], v[2], v[1]])
 
-        raise ValueError(
-            "Stress tensor not found in CASTEP output — "
-            "neither GeomOpt (<-- S) nor SinglePoint (Symmetrised Stress Tensor) "
-            "format matched. SCF may have failed."
-        )
+        raise ValueError("Stress tensor not found in CASTEP output.")
 
-    def cleanup(self, step_dir: Path) -> None:
-        for glob_pat in self._cleanup_globs:
-            for f in step_dir.glob(glob_pat):
-                try: f.unlink()
-                except OSError: pass
+    # ── Progress Monitor ──────────────────────────────────────────────────────
+
+    def progress_monitor(self, proc: subprocess.Popen, stop: threading.Event) -> None:
+        if proc.stdout is not None:
+            threading.Thread(
+                target=lambda: [_ for _ in iter(proc.stdout.readline, b"")], daemon=True
+            ).start()
+
+        cwd_path: Path | None = getattr(proc, "_cwd", None)
+        t0 = time.time()
+        geo, geo_seen = 0, 0
+        scf, scf_seen = 0, 0
+        last_size = 0
+        castep_file: Path | None = None
+
+        def _render() -> None:
+            width = shutil.get_terminal_size().columns or 80
+            scf_denom = max(scf_seen + 2, 5)
+            pct = min(100, int(scf * 100 / scf_denom))
+            filled = pct * 30 // 100
+            bar = "█" * filled + "░" * (30 - filled)
+            el = int(time.time() - t0)
+            mm, ss_v = divmod(el, 60)
+            scf_str = f"{scf}/{scf_seen}" if scf_seen >= 1 else f"{scf}/—"
+
+            line = f"  │  [{bar}] {pct:3d}%  geo {geo}  scf {scf_str}  ⏱ {mm:02d}:{ss_v:02d}"
+            if len(line) > width - 1:
+                line = line[: width - 4] + "..."
+            print(f"\r{line.ljust(width - 1)}", end="", flush=True)
+
+        if cwd_path is not None:
+            deadline = time.monotonic() + 15.0
+            while not stop.is_set() and time.monotonic() < deadline:
+                candidates = list(cwd_path.glob("*.castep"))
+                if candidates:
+                    castep_file = max(candidates, key=lambda p: p.stat().st_mtime)
+                    break
+                time.sleep(0.5)
+
+        while not stop.is_set():
+            if castep_file is None or not castep_file.exists():
+                _render()
+                time.sleep(1.0)
+                continue
+
+            try:
+                size = castep_file.stat().st_size
+                if size == last_size:
+                    _render()
+                    time.sleep(0.8)
+                    continue
+
+                text = read_tail(castep_file, max_bytes=2 * 1024 * 1024)
+                last_size = size
+
+                for line in text.splitlines():
+                    if "LBFGS: finished iteration" in line:
+                        parts = line.split()
+                        try:
+                            geo = int(parts[parts.index("iteration") + 1])
+                            geo_seen = max(geo_seen, geo)
+                            scf = 0
+                        except (ValueError, IndexError):
+                            pass
+                    elif "<-- SCF" in line:
+                        s = line.lstrip()
+                        if s and s[0].isdigit():
+                            try:
+                                scf = int(s.split()[0])
+                                scf_seen = max(scf_seen, scf)
+                            except ValueError:
+                                pass
+                _render()
+                time.sleep(0.8)
+            except FileNotFoundError:
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(1.0)
+
+        print(
+            "\r" + " " * (shutil.get_terminal_size().columns or 80),
+            end="\r",
+            flush=True,
+        )
