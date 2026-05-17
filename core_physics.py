@@ -3,11 +3,18 @@ core_physics.py  —  Crystal representation, symmetry, strain, and elastic fitt
 No silent exceptions. Engine-agnostic.
 """
 
+from __future__ import annotations
+
 import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    import ase
+    from runstate import RunState, Step
+
 
 import config
 import numpy as np
@@ -43,17 +50,29 @@ def abc_to_lattice(
     gamma: float,
 ) -> np.ndarray:
     """Convert (a, b, c, alpha, beta, gamma) to upper-triangular 3x3 matrix."""
-    ar, br, gr = np.radians(alpha), np.radians(beta), np.radians(gamma)
-    sg = max(float(np.sin(gr)), 1e-15)
-    cx = c * float(np.cos(br))
-    cy = c * (float(np.cos(ar)) - float(np.cos(br)) * float(np.cos(gr))) / sg
-    cz = float(np.sqrt(max(c**2 - cx**2 - cy**2, 0.0)))
-    return np.array([[a, 0.0, 0.0], [b * float(np.cos(gr)), b * sg, 0.0], [cx, cy, cz]])
+    ar, br, gr = math.radians(alpha), math.radians(beta), math.radians(gamma)
+    sg = max(math.sin(gr), 1e-15)
+    cx = c * math.cos(br)
+    cy = c * (math.cos(ar) - math.cos(br) * math.cos(gr)) / sg
+    cz = math.sqrt(max(c**2 - cx**2 - cy**2, 0.0))
+    return np.array([[a, 0.0, 0.0], [b * math.cos(gr), b * sg, 0.0], [cx, cy, cz]])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core Data Structures
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Shared lookup for lattice_type and strain_pattern_code.
+# Each row: (min_spacegroup_number, lattice_name, strain_pattern_code).
+# Rows are tested in descending order; first match wins.
+_SG_THRESHOLDS: list[tuple[int, str, int]] = [
+    (195, "cubic",        5),
+    (168, "hexagonal",    7),
+    (143, "trigonal",     6),
+    (75,  "tetragonal",   4),
+    (16,  "orthorhombic", 3),
+    (3,   "monoclinic",   2),
+]
 
 
 @dataclass
@@ -62,11 +81,20 @@ class Crystal:
 
     lattice: np.ndarray
     frac_coords: np.ndarray
-    species: list[str]
+    sites: list[dict[str, float]]
 
     @property
     def num_atoms(self) -> int:
-        return len(self.species)
+        return len(self.sites)
+
+    @property
+    def species(self) -> list[str]:
+        """Returns a list of unique element symbols present in the crystal."""
+        all_species = set()
+        for site in self.sites:
+            all_species.update(site.keys())
+        return sorted(list(all_species))
+
 
     @property
     def volume(self) -> float:
@@ -81,9 +109,21 @@ class Crystal:
 
     def _get_spglib_dataset(self) -> Any:
         if self._sym_dataset is None:
+            # For symmetry analysis, represent each site by its dominant species.
+            # This is a simplification for VCA crystals. For SQS/direct, there's only one species per site.
+            temp_species = []
+            for site in self.sites:
+                if not site:
+                    # Handle empty site dict if it can happen
+                    temp_species.append("X") # Placeholder
+                else:
+                    # Get species with highest occupancy
+                    dominant_species = max(site, key=site.get)
+                    temp_species.append(dominant_species)
+
             nums = [
                 config.ELEMENTS.get(s.capitalize(), {}).get("Z", 1)
-                for s in self.species
+                for s in temp_species
             ]
             cell = (self.lattice, self.frac_coords, nums)
             # symprec=1e-5 is the default; callers needing a different tolerance
@@ -112,36 +152,18 @@ class Crystal:
     @property
     def lattice_type(self) -> str:
         sg = self.spacegroup_number
-        if sg >= 195:
-            return "cubic"
-        if sg >= 168:
-            return "hexagonal"
-        if sg >= 143:
-            return "trigonal"
-        if sg >= 75:
-            return "tetragonal"
-        if sg >= 16:
-            return "orthorhombic"
-        if sg >= 3:
-            return "monoclinic"
+        for threshold, name, _ in _SG_THRESHOLDS:
+            if sg >= threshold:
+                return name
         return "triclinic"
 
     @property
     def strain_pattern_code(self) -> int:
         sg = self.spacegroup_number
-        if sg >= 195:
-            return 5  # cubic
-        if sg >= 168:
-            return 7  # hexagonal
-        if sg >= 143:
-            return 6  # trigonal
-        if sg >= 75:
-            return 4  # tetragonal
-        if sg >= 16:
-            return 3  # orthorhombic
-        if sg >= 3:
-            return 2  # monoclinic
-        return 1  # triclinic
+        for threshold, _, code in _SG_THRESHOLDS:
+            if sg >= threshold:
+                return code
+        return 1
 
     def get_symmetry_operations(
         self,
@@ -169,44 +191,13 @@ class Crystal:
 
     # ── New Crystal methods ───────────────────────────────────────────────────
 
-    def with_vegard(
-        self, template_element: str, target_mix: dict[str, float]
-    ) -> "Crystal":
-        """Return a new Crystal with lattice uniformly scaled by Vegard law.
+    def to_ase(self) -> "ase.Atoms":
+        """Convert to ASE Atoms.
 
-        k = r_mix / r_template, where r_mix weights the alloy atomic radii.
-        Returns self unchanged when k ≈ 1 or when radii are unavailable.
+        NOTE: For sites with fractional occupancy, this method simplifies by
+        choosing the species with the highest occupancy. This is a limitation
+        of the ASE Atoms object, which does not natively support VCA.
         """
-        eps = 1e-9
-        nonzero_mix = {e: f for e, f in target_mix.items() if f > eps}
-        if not nonzero_mix:
-            return self
-
-        r_template = config.ELEMENTS.get(template_element.capitalize(), {}).get(
-            "rad", 0.0
-        )
-        if r_template < 1e-6:
-            return self
-
-        total_new_frac = sum(nonzero_mix.values())
-        template_remaining = max(0.0, 1.0 - total_new_frac)
-        # Vegard: r_mix = r_tmpl*(1-Σf) + Σ(r_i * f_i)
-        r_mix = r_template * template_remaining + sum(
-            config.ELEMENTS.get(e.capitalize(), {}).get("rad", 0.0) * f
-            for e, f in nonzero_mix.items()
-        )
-
-        if r_mix < 1e-6 or abs(r_mix / r_template - 1.0) < 1e-9:
-            return self
-
-        return Crystal(
-            lattice=self.lattice * (r_mix / r_template),
-            frac_coords=self.frac_coords.copy(),
-            species=list(self.species),
-        )
-
-    def to_ase(self, mix: dict[str, float] | None = None) -> "ase.Atoms":
-        """Convert to ASE Atoms. If mix is provided, VCA-average atomic numbers/masses."""
         try:
             import ase
             import ase.data
@@ -215,47 +206,20 @@ class Crystal:
 
         cart_positions = self.frac_coords @ self.lattice
 
-        if mix is None:
-            numbers = [
-                config.ELEMENTS.get(s.capitalize(), {}).get("Z", 1)
-                for s in self.species
-            ]
-            return ase.Atoms(
-                numbers=numbers,
-                positions=cart_positions,
-                cell=self.lattice,
-                pbc=True,
-            )
-
-        # VCA averaging: compute a single effective Z and mass for the mix
-        averaged_Z = sum(
-            config.ELEMENTS[e.capitalize()]["Z"] * f for e, f in mix.items()
-        )
-        averaged_mass = sum(
-            ase.data.atomic_masses[config.ELEMENTS[e.capitalize()]["Z"]] * f
-            for e, f in mix.items()
-        )
-        template_syms = set(mix.keys())
-
-        numbers = []
-        masses = []
-        for s in self.species:
-            if s.capitalize() in {t.capitalize() for t in template_syms}:
-                numbers.append(int(round(averaged_Z)))
-                masses.append(averaged_mass)
+        symbols = []
+        for site in self.sites:
+            if site:
+                dominant_species = max(site, key=site.get)
+                symbols.append(dominant_species)
             else:
-                z = config.ELEMENTS.get(s.capitalize(), {}).get("Z", 1)
-                numbers.append(z)
-                masses.append(ase.data.atomic_masses[z])
+                symbols.append("X")  # Placeholder for an empty site
 
-        atoms = ase.Atoms(
-            numbers=numbers,
+        return ase.Atoms(
+            symbols=symbols,
             positions=cart_positions,
             cell=self.lattice,
             pbc=True,
         )
-        atoms.set_masses(masses)
-        return atoms
 
     @classmethod
     def from_ase(cls, atoms: "ase.Atoms") -> "Crystal":
@@ -266,26 +230,26 @@ class Crystal:
             raise ImportError("pip install ase")
 
         species = [ase.data.chemical_symbols[z] for z in atoms.numbers]
+        sites = [{s: 1.0} for s in species]
         frac_coords = atoms.get_scaled_positions()
         lattice = np.array(atoms.get_cell())
-        return cls(lattice=lattice, frac_coords=frac_coords, species=species)
+        return cls(lattice=lattice, frac_coords=frac_coords, sites=sites)
 
-    def vec(
-        self,
-        species_mix: list[tuple[str, float]],
-        nonmetal: str | None = None,
-    ) -> float:
-        """Valence Electron Concentration for a given composition species_mix."""
-        metal_vec = sum(
-            frac * config.ELEMENTS.get(elem.capitalize(), {}).get("val", 0)
-            for elem, frac in species_mix
-        )
-        nm_vec = (
-            config.ELEMENTS.get(nonmetal.capitalize(), {}).get("val", 0)
-            if nonmetal
-            else 0
-        )
-        return metal_vec + nm_vec
+    def vec(self) -> float:
+        """Computes the average Valence Electron Concentration (VEC) per site."""
+        total_electrons = 0.0
+        num_sites = len(self.sites)
+
+        if num_sites == 0:
+            return 0.0
+
+        for site in self.sites:
+            for element, fraction in site.items():
+                total_electrons += fraction * config.ELEMENTS.get(
+                    element.capitalize(), {}
+                ).get("val", 0)
+
+        return total_electrons / num_sites
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,6 +261,11 @@ def load_crystal(file_path: Path) -> Crystal:
     """Load any geometry file and return a canonical primitive Crystal."""
     raw = _read_raw(file_path)
     return standardize_crystal(raw, symprec=1e-5)
+
+
+def read_geometry(file_path: Path) -> Crystal:
+    """Read geometry file without standardization. Public API for engines."""
+    return _read_raw(file_path)
 
 
 def _read_raw(file_path: Path) -> Crystal:
@@ -331,7 +300,7 @@ def _read_raw(file_path: Path) -> Crystal:
 
     except ImportError:
         raise ValueError(
-            f"Unsupported geometry format: '{file_path.name}'. \n"
+            f"Unsupported geometry format: '{file_path.name}'. "
             f"  Hint: Install ASE (`pip install ase`) to automatically read this and 100+ other formats."
         )
     except Exception as e:
@@ -340,8 +309,17 @@ def _read_raw(file_path: Path) -> Crystal:
 
 def standardize_crystal(crystal: Crystal, *, symprec: float) -> Crystal:
     """Standardize to the primitive cell. symprec is required — differs by use-case."""
+    # For standardization, represent each site by its dominant species.
+    temp_species = []
+    for site in crystal.sites:
+        if site:
+            dominant_species = max(site, key=site.get)
+            temp_species.append(dominant_species)
+        else:
+            temp_species.append("X")
+
     nums = [
-        config.ELEMENTS.get(s.capitalize(), {}).get("Z", 1) for s in crystal.species
+        config.ELEMENTS.get(s.capitalize(), {}).get("Z", 1) for s in temp_species
     ]
     cell = (crystal.lattice, crystal.frac_coords, nums)
     std = spglib.standardize_cell(cell, to_primitive=True, symprec=symprec)
@@ -350,8 +328,9 @@ def standardize_crystal(crystal: Crystal, *, symprec: float) -> Crystal:
 
     L, f_coords, n = std
     z_to_sym = {v["Z"]: k for k, v in config.ELEMENTS.items()}
-    species = [z_to_sym.get(z, "X") for z in n]
-    return Crystal(lattice=L, frac_coords=f_coords, species=species)
+    new_species = [z_to_sym.get(z, "X") for z in n]
+    new_sites = [{s: 1.0} for s in new_species]
+    return Crystal(lattice=L, frac_coords=f_coords, sites=new_sites)
 
 
 def _read_cif_raw(text: str) -> Crystal:
@@ -379,7 +358,7 @@ def _read_cif_raw(text: str) -> Crystal:
 
     sp, fc_list = [], []
     loop_pat = re.compile(
-        r"loop_\s+((?:_atom_site_\S+\s+)+)((?:(?!loop_|_\S+\s+).*\n?)+)", re.M
+            r"loop_\s+((?:_atom_site_\S+\s+)+)((?:(?!loop_|_\S+\s+).*\n?)+)", re.M
     )
     for lm in loop_pat.finditer(text):
         cols = re.findall(r"(_atom_site_\S+)", lm.group(1))
@@ -412,12 +391,12 @@ def _read_cif_raw(text: str) -> Crystal:
             except ValueError:
                 continue
 
-    return Crystal(lattice=L, frac_coords=np.array(fc_list), species=sp)
+    sites = [{s: 1.0} for s in sp]
+    return Crystal(lattice=L, frac_coords=np.array(fc_list), sites=sites)
 
 
 def _read_castep_cell(text: str) -> Crystal:
-    m_lat = re.search(
-        r"%BLOCK\s+LATTICE_CART\s*\n(.*?)%ENDBLOCK\s+LATTICE_CART",
+    m_lat = re.search(r"%BLOCK\s+LATTICE_CART\s*(.*?)%ENDBLOCK\s+LATTICE_CART",
         text,
         re.DOTALL | re.I,
     )
@@ -433,24 +412,35 @@ def _read_castep_cell(text: str) -> Crystal:
             except ValueError:
                 continue
 
-    m_pos = re.search(
-        r"%BLOCK\s+POSITIONS_FRAC\s*\n(.*?)%ENDBLOCK\s+POSITIONS_FRAC",
+    m_pos = re.search(r"%BLOCK\s+POSITIONS_FRAC\s*(.*?)%ENDBLOCK\s+POSITIONS_FRAC",
         text,
         re.DOTALL | re.I,
     )
-    raw_pairs: dict[tuple, str] = {}
+
+    # In VCA, multiple lines can refer to the same site. We need to group them.
+    # We use a dictionary where keys are coordinate tuples.
+    site_map = {}
+
     for line in m_pos.group(1).splitlines():
         parts = line.split()
         if len(parts) >= 4 and parts[0].isalpha():
-            key = tuple(
-                np.round([float(parts[1]), float(parts[2]), float(parts[3])], 4)
-            )
-            if key not in raw_pairs:
-                raw_pairs[key] = parts[0].capitalize()
+            species = parts[0].capitalize()
+            coords = tuple(float(p) for p in parts[1:4])
 
-    sp = list(raw_pairs.values())
-    fc = [list(k) for k in raw_pairs.keys()]
-    return Crystal(lattice=np.array(vecs), frac_coords=np.array(fc), species=sp)
+            occupancy = 1.0
+            mixture_match = re.search(r"MIXTURE:\(\s*\d+\s+([\d\.]+)\s*\)", line, re.IGNORECASE)
+            if mixture_match:
+                occupancy = float(mixture_match.group(1))
+
+            if coords not in site_map:
+                site_map[coords] = {}
+            site_map[coords][species] = occupancy
+
+    # Now, build the final lists for the Crystal object
+    fc_list = list(site_map.keys())
+    sites_list = [site_map[coords] for coords in fc_list]
+
+    return Crystal(lattice=np.array(vecs), frac_coords=np.array(fc_list), sites=sites_list)
 
 
 def _read_vasp_poscar(text: str) -> Crystal:
@@ -477,15 +467,8 @@ def _read_vasp_poscar(text: str) -> Crystal:
     if lines[start_idx - 1].lower().startswith(("c", "k")):
         raw_fc = (np.array(raw_fc) @ np.linalg.inv(np.array(vecs))).tolist()
 
-    raw_pairs: dict[tuple, str] = {}
-    for s, c in zip(raw_sp, raw_fc):
-        key = tuple(np.round(c, 4))
-        if key not in raw_pairs:
-            raw_pairs[key] = s
-
-    sp = list(raw_pairs.values())
-    fc = [list(k) for k in raw_pairs.keys()]
-    return Crystal(lattice=np.array(vecs), frac_coords=np.array(fc), species=sp)
+    sites = [{s: 1.0} for s in raw_sp]
+    return Crystal(lattice=np.array(vecs), frac_coords=np.array(raw_fc), sites=sites)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,22 +508,19 @@ class StrainStep:
 def generate_strain_steps(
     crystal: Crystal, max_strain: float = 0.003, n_steps: int = 3
 ) -> list[StrainStep]:
-    """Generate optimal strain steps based on crystal symmetry."""
-    pattern_code = crystal.strain_pattern_code
-    patterns = _STRAIN_PATTERNS[pattern_code]
-
-    L = crystal.lattice
-    if crystal.lattice_type == "cubic":
-        vol = crystal.volume
-        a_conv = (
-            (4.0 * vol) ** (1.0 / 3.0)
-            if crystal.spacegroup_symbol.startswith("F")
-            else (2.0 * vol) ** (1.0 / 3.0)
-        )
-        L = np.diag([a_conv, a_conv, a_conv])
-
-    a, b, c = np.linalg.norm(L, axis=1)
-    lens = [a, b, c, c, b, a]
+    """Generate universal strain steps for ANY crystal symmetry.
+    Always uses the full 6-dimensional strain basis to ensure the Cij matrix
+    is never singular, enabling true universal fitting.
+    Returns engineering Voigt strains (mag, not 0.5*mag for shear).
+    """
+    patterns = [
+        [1, 0, 0, 0, 0, 0],  # C11, C12, C13
+        [0, 1, 0, 0, 0, 0],  # C22, C23
+        [0, 0, 1, 0, 0, 0],  # C33
+        [0, 0, 0, 1, 0, 0],  # C44
+        [0, 0, 0, 0, 1, 0],  # C55
+        [0, 0, 0, 0, 0, 1],  # C66
+    ]
 
     steps: list[StrainStep] = []
     for pi, pattern in enumerate(patterns, 1):
@@ -552,126 +532,219 @@ def generate_strain_steps(
                 v = np.zeros(6)
                 for i, p in enumerate(pattern):
                     if p:
-                        v[i] = p * mag / lens[i] if i < 3 else 0.5 * p * mag / lens[i]
+                        # Engineering Voigt strain: ε1, ε2, ε3, γ4, γ5, γ6
+                        # No 0.5 factor here; that belongs in the deformation gradient building.
+                        # No division by lattice vector lengths: strain must be uniform.
+                        v[i] = p * mag
                 steps.append(StrainStep(pi, sc, mag, v))
     return steps
 
-
-def fit_cij_cubic(
+def fit_cij_universal(
     stresses: list[np.ndarray],
     strains: list[np.ndarray],
     density_gcm3: float | None = None,
     n_atoms: int | None = None,
     volume_ang3: float | None = None,
 ) -> dict[str, Any]:
+    """Універсальний фіттер матриці Cij 6x6 для БУДЬ-ЯКОЇ сингонії з урахуванням залишкового стресу."""
     if len(stresses) < 3:
         return {"error": f"Need >= 3 stress tensors, got {len(stresses)}"}
-    sa, ea = np.array(stresses), np.array(strains)
 
-    def _ols(x, y):
-        n = len(x)
-        d = n * np.dot(x, x) - x.sum() ** 2
-        if abs(d) < 1e-30:
-            return float("nan"), 0.0
-        slope = (n * np.dot(x, y) - x.sum() * y.sum()) / d
-        ic = (y.sum() - slope * x.sum()) / n
-        tot = float(np.sum((y - y.sum() / n) ** 2))
-        r2 = (
-            1.0 - float(np.sum((y - slope * x - ic) ** 2)) / tot if tot > 1e-12 else 1.0
-        )
-        return slope, r2
+    E = np.vstack(strains)
+    S = np.vstack(stresses)
 
-    c11, r2_11 = _ols(ea[:, 0], sa[:, 0])
-    c12, r2_12 = _ols(ea[:, 0], sa[:, 1])
-    c44, r2_44 = _ols(ea[:, 3], sa[:, 3])
+    # МАГІЯ ТУТ: Додаємо колонку одиниць для фітування вільного члена (залишкового стресу S0)
+    E_with_intercept = np.hstack([E, np.ones((E.shape[0], 1))])
 
-    if any(np.isnan(v) for v in (c11, c12, c44)):
-        return {"error": "NaN in OLS fit"}
+    try:
+        # Розв'язуємо E * C_T + 1 * S0 = S
+        sol, residuals, rank, s_vals = np.linalg.lstsq(E_with_intercept, S, rcond=None)
+        C_T = sol[:-1, :]  # Матриця пружності (6x6)
+        S0 = sol[-1, :]    # Залишковий стрес (6,)
+        C = C_T.T
+    except np.linalg.LinAlgError:
+        return {"error": "Linear algebra solver failed to fit Cij matrix."}
 
-    props = cubic_vrh(c11, c12, c44, density_gcm3, n_atoms, volume_ang3)
+    # Термодинамічна вимога: матриця Cij має бути симетричною
+    C = (C + C.T) / 2.0
 
-    # Always record raw elastic constants even when Born stability is violated
+    # Розрахунок якості фіту (R^2)
+    S_pred = E_with_intercept @ sol
+    S_mean = np.mean(S, axis=0)
+    SS_tot = np.sum((S - S_mean)**2, axis=0)
+    SS_res = np.sum((S - S_pred)**2, axis=0)
+
+    # Розрахуємо глобальний R2 (зважений за дисперсією компонент)
+    total_SS_tot = np.sum(SS_tot)
+    total_SS_res = np.sum(SS_res)
+    r2_global = 1.0 - (total_SS_res / total_SS_tot) if total_SS_tot > 1e-12 else 0.0
+
+    # Мінімальний R2 серед компонент з суттєвою дисперсією (> 1% від макс)
+    max_ss_tot = np.max(SS_tot)
+    r2_vals = []
+    for i in range(6):
+        if SS_tot[i] > 0.01 * max_ss_tot:
+            r2_vals.append(1.0 - (SS_res[i] / SS_tot[i]))
+    
+    r2_min = float(np.min(r2_vals)) if r2_vals else r2_global
+
+    props = universal_vrh(C, density_gcm3, n_atoms, volume_ang3)
+
     result = {
-        "C11": f"{c11:.4f}",
-        "C12": f"{c12:.4f}",
-        "C44": f"{c44:.4f}",
         "born_stable": "yes" if props.get("born_stable") else "no",
         "elastic_n_points": str(len(stresses)),
-        "elastic_R2_min": f"{min(r2_11, r2_12, r2_44):.4f}",
+        "elastic_R2_min": f"{r2_min:.4f}",
+        "elastic_R2_global": f"{r2_global:.4f}",
+        "residual_pressure_GPa": f"{np.mean(S0[:3]):.4f}", 
     }
-    if min(r2_11, r2_12, r2_44) < 0.99:
-        result["elastic_quality_note"] = "Low R2"
 
-    # Overlay VRH-derived quantities when available
+    # Extract all Voigt components: Cij (i,j in 1..6)
+    # Voigt index mapping: 0=xx, 1=yy, 2=zz, 3=yz, 4=xz, 5=xy
+    for i in range(6):
+        for j in range(i, 6):
+            key = f"C{i+1}{j+1}"
+            result[key] = f"{C[i,j]:.4f}"
+
+    if r2_min < 0.90:
+        result["elastic_quality_note"] = "Poor Fit (Non-linear/Unstable)"
+    elif r2_min < 0.98:
+        result["elastic_quality_note"] = "Acceptable Fit"
+
     for k, v in props.items():
         if k not in result:
             result[k] = f"{v:.4f}" if isinstance(v, float) else v
 
     return result
 
-
-def cubic_vrh(
-    c11: float,
-    c12: float,
-    c44: float,
+def universal_vrh(
+    C: np.ndarray,
     density: float | None = None,
     n_atoms: int | None = None,
     vol: float | None = None,
 ) -> dict[str, Any]:
-    born_stable = c11 > 0 and c44 > 0 and c11 > abs(c12) and c11 + 2 * c12 > 0
+    """
+    Універсальний розрахунок Voigt-Reuss-Hill.
+    Захищено від розрахунку твердості для нестабільних ґраток.
+    """
+    if C.shape != (6, 6):
+        return {"error": f"Matrix must be 6x6, got {C.shape}"}
+
+    try:
+        eigenvalues = np.linalg.eigvals(C)
+        born_stable = bool(np.all(eigenvalues > 0))
+    except np.linalg.LinAlgError:
+        return {"error": "Cij matrix is invalid (failed eigenvalue calculation)."}
+
+    try:
+        S = np.linalg.inv(C)
+    except np.linalg.LinAlgError:
+        return {"error": "Cij matrix is singular (non-invertible).", "born_stable": False}
+
+    # Наближення Фойгта (Voigt Bounds)
+    K_V = (C[0, 0] + C[1, 1] + C[2, 2]) + 2 * (C[0, 1] + C[0, 2] + C[1, 2])
+    K_V /= 9.0
+
+    G_V = (C[0, 0] + C[1, 1] + C[2, 2]) - (C[0, 1] + C[0, 2] + C[1, 2]) + 3 * (C[3, 3] + C[4, 4] + C[5, 5])
+    G_V /= 15.0
+
+    # Наближення Ройсса (Reuss Bounds)
+    K_R_inv = (S[0, 0] + S[1, 1] + S[2, 2]) + 2 * (S[0, 1] + S[0, 2] + S[1, 2])
+    K_R = 1.0 / K_R_inv if abs(K_R_inv) > 1e-12 else float('nan')
+
+    G_R_inv = 4 * (S[0, 0] + S[1, 1] + S[2, 2]) - 4 * (S[0, 1] + S[0, 2] + S[1, 2]) + 3 * (S[3, 3] + S[4, 4] + S[5, 5])
+    G_R = 15.0 / G_R_inv if abs(G_R_inv) > 1e-12 else float('nan')
+
+    K_H = (K_V + K_R) / 2.0
+    G_H = (G_V + G_R) / 2.0
+
     props: dict[str, Any] = {
-        "C11": c11,
-        "C12": c12,
-        "C44": c44,
         "born_stable": born_stable,
+        "B_Voigt_GPa": K_V, "B_Reuss_GPa": K_R, "B_Hill_GPa": K_H,
+        "G_Voigt_GPa": G_V, "G_Reuss_GPa": G_R, "G_Hill_GPa": G_H,
     }
-    if not born_stable:
-        return props  # Return raw constants; caller decides how to handle
 
-    bv = (c11 + 2 * c12) / 3
-    gv = (c11 - c12 + 3 * c44) / 5
-    den = (c11 + c12) * (c11 - c12)
-    s11 = (c11 + c12) / den
-    s12 = -c12 / den
-    s44 = 1.0 / c44
-    br = 1.0 / (3 * (s11 + 2 * s12))
-    gr = 5.0 / (4 * (s11 - s12) + 3 * s44)
-    bh = (bv + br) / 2
-    gh = (gv + gr) / 2
-    pugh = gh / bh
-
-    props.update(
-        {
-            "B_Voigt_GPa": bv,
-            "B_Reuss_GPa": br,
-            "B_Hill_GPa": bh,
-            "G_Voigt_GPa": gv,
-            "G_Reuss_GPa": gr,
-            "G_Hill_GPa": gh,
-            "E_GPa": 9 * bh * gh / (3 * bh + gh),
-            "nu": (3 * bh - 2 * gh) / (2 * (3 * bh + gh)),
-            "Zener_A": 2 * c44 / (c11 - c12),
+    # РАХУЄМО ТВЕРДІСТЬ ТІЛЬКИ ЯКЩО КРИСТАЛ ФІЗИЧНО СТАБІЛЬНИЙ
+    if born_stable and K_H > 0 and G_H > 0:
+        E = 9 * K_H * G_H / (3 * K_H + G_H)
+        nu = (3 * K_H - 2 * G_H) / (2 * (3 * K_H + G_H))
+        pugh = G_H / K_H
+        props.update({
+            "E_GPa": E, "nu": nu,
             "Pugh_ratio": pugh,
-            "Cauchy_pressure_GPa": c12 - c44,
-            "C_prime_GPa": (c11 - c12) / 2,
-            # Chen 2011 and Tian 2012 empirical hardness models
-            "H_Vickers_Chen_GPa": max(0.0, 2 * (pugh**2 * gh) ** 0.585 - 3),
-            "H_Vickers_Tian_GPa": 0.92 * (pugh**1.137) * (gh**0.708),
-        }
-    )
+            "Cauchy_pressure_GPa": K_H - (2 * G_H / 3)
+        })
 
-    if density and density > 0:
-        rho = density * 1e3  # g/cm³ → kg/m³
-        vl = ((bh + 4 * gh / 3) * 1e9 / rho) ** 0.5
-        vs = (gh * 1e9 / rho) ** 0.5
+        try:
+            props["H_Vickers_Chen_GPa"] = max(0.0, float(2 * (pugh**2 * G_H) ** 0.585 - 3))
+            props["H_Vickers_Tian_GPa"] = max(0.0, float(0.92 * (pugh**1.137) * (G_H**0.708)))
+        except Exception:
+            pass
+
+    if density and density > 0 and K_H > 0 and G_H > 0:
+        rho = density * 1e3
+        vl = ((K_H + 4 * G_H / 3) * 1e9 / rho) ** 0.5
+        vs = (G_H * 1e9 / rho) ** 0.5
         vm = (1 / 3 * (2 / vs**3 + 1 / vl**3)) ** (-1 / 3)
         props.update({"v_longitudinal_ms": vl, "v_transverse_ms": vs, "v_mean_ms": vm})
         if n_atoms and vol and vol > 0:
-            # Debye temperature: ħ/k_B * v_m * (6π² n/V)^(1/3)
-            props["T_Debye_K"] = (
-                (1.05457e-34 / 1.3806e-23)
-                * vm
-                * (6 * np.pi**2 * (n_atoms / (vol * 1e-30))) ** (1 / 3)
-            )
+            props["T_Debye_K"] = (1.05457e-34 / 1.3806e-23) * vm * (6 * np.pi**2 * (n_atoms / (vol * 1e-30))) ** (1 / 3)
 
     return props
+
+def vec_for_system(
+    species_mix: list[tuple[str, float]],
+    nonmetal: str | None = None,
+) -> float:
+    """Valence-electron concentration for a composition spec.
+
+    Args:
+        species_mix: list of (element, fraction) on the substituted sublattice.
+        nonmetal:    symbol of the non-metal sublattice species (e.g. 'C', 'N'),
+                     or None for pure-metal systems.
+    """
+    metal_vec = sum(
+        frac * config.ELEMENTS.get(elem.capitalize(), {}).get("val", 0)
+        for elem, frac in species_mix
+    )
+    nm_vec = (
+        config.ELEMENTS.get(nonmetal.capitalize(), {}).get("val", 0)
+        if nonmetal else 0
+    )
+    return metal_vec + nm_vec
+
+
+def _maybe_decorate_dh_mix(state: "RunState") -> None:
+    """Add dH_mix_meV_per_fu where computable. Only for binary VCA."""
+    if state.single_mode or len(state.species) > 2:
+        return
+    dh_data = mixing_enthalpy(state.steps)
+    for x, _, dh in dh_data:
+        for s in state.steps:
+            if s.status == "done" and abs(s.concentration - x) < 1e-9:
+                s.parsed.setdefault("dH_mix_meV_per_fu", f"{dh:.3f}")
+
+
+def mixing_enthalpy(
+    steps: list["Step"],
+) -> list[tuple[float, float, float]]:
+    def _h(s: "Step") -> float | None:
+        try:
+            return float(s.parsed["enthalpy_eV"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    done = [s for s in steps if s.status == "done" and _h(s) is not None]
+    try:
+        h0 = next(_h(s) for s in done if abs(s.concentration) < 1e-4)
+        h1 = next(_h(s) for s in done if abs(s.concentration - 1) < 1e-4)
+    except StopIteration:
+        return []
+
+    out: list[tuple[float, float, float]] = []
+    for s in done:
+        h = _h(s)
+        if h is None:
+            continue
+        dh = (h - ((1 - s.concentration) * h0 + s.concentration * h1)) * 1000
+        out.append((s.concentration, h, dh))
+    return sorted(out, key=lambda t: t[0])

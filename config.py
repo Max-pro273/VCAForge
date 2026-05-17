@@ -84,6 +84,18 @@ ELEMENTS: dict[str, dict[str, Any]] = {
     "Pb": {"Z": 82, "val": 4, "rad": 1.75, "en": 2.33, "hard": False, "mag": False, "nonmetal": False},
 }
 
+# ── SQS (Special Quasirandom Structures via sqsgenerator) ────────────────────
+# These defaults are used by crystal_modes.SQSStrategy. Override per-run
+# either by editing this file or by extending the wizard schema.
+SQS_MAX_EXTENT: int = 3
+SQS_ITERATIONS: int = 1_000_000       # Monte-Carlo iterations
+SQS_SHELL_WEIGHTS: dict[int, float] = {1: 1.0}  # coordination shells → weight
+SQS_SUBDIR: str = "SQS"
+# Number of parallel Monte-Carlo threads passed to sqsgenerator as
+# thread_config=[N]. Set to 0 to let sqsgenerator choose automatically
+# (uses all available CPU cores). The sqs.py standalone default was 6.
+SQS_THREADS: int = 0
+
 # ── CASTEP Specific ──────────────────────────────────────────────────────────
 TASKS_FULL: list[str] = ["GeometryOptimization", "SinglePoint", "ElasticConstants"]
 TASKS_VCA: list[str] = ["GeometryOptimization", "SinglePoint"]
@@ -109,7 +121,7 @@ GEOM_S_TOL: str = "0.03 GPa"
 GEOM_D_TOL: str = "0.0005 ang"
 FINITE_BASIS: int = 0
 
-CASTEP_CLEANUP_GLOBS: list[str] = ["*.check", "*.bib", "*.bands", "*.cst_esp", "*.err", "*.usp", "*.cst_esp"]
+CASTEP_CLEANUP_GLOBS: list[str] = ["*.check", "*.bib", "*.bands", "*.cst_esp", "*.err", "*.usp"]
 CASTEP_SEARCH_PATHS: list[str] = [
     "~/Applications/CASTEP*/bin/*/castep.mpi",
     "~/Applications/CASTEP*/bin/*/castep",
@@ -170,7 +182,7 @@ SMAX_KILL_GPa: float = 50.0
 SMAX_STALL_ITERS: int = 15
 
 # ── Navigator (Bayesian Optimization) ────────────────────────────────────────
-NAVIGATOR_TARGET: str = "H_Vickers_GPa"
+NAVIGATOR_TARGET: str = "H_Vickers_Tian_GPa"
 NAVIGATOR_MODE: str = "maximize"          # "maximize" | "minimize"
 NAVIGATOR_ACQUISITION: str = "CEI"        # "CEI" | "EI" | "UCB" | "MaxVar"
 NAVIGATOR_N_STARTS: int = 20
@@ -224,14 +236,13 @@ NAVIGATOR_DONE_DEDUPE_REPEATS: int = 3    # N consecutive duplicate suggestions 
 NAVIGATOR_FIDELITY_LEVELS = None
 
 # ── MLIP Engine ──────────────────────────────────────────────────────────────
-MLIP_DEFAULT_BACKEND: str = "mace"
+MLIP_DEFAULT_BACKEND: str = "mace-mpa-0"
 MLIP_FMAX: float = 0.01            # eV/Å convergence for ASE BFGS
 MLIP_RELAX_STEPS: int = 300        # max ionic steps
-MLIP_ELASTIC_DELTA: float = 0.003  # Voigt strain delta (matches ELASTIC_MAX_STRAIN)
 MLIP_DEVICE: str = "cpu"           # "cpu" | "cuda" | "mps"
 MLIP_CACHE_PATHS: list[str] = [    # auto-discovery of model files
-    "~/.cache/mace/*",
     "~/.cache/mace/*",
     "~/.local/share/mace/*",
 ]
 MLIP_SUBDIR: str = "MLIP"
+MLIP_OPTIMIZER: str = ""

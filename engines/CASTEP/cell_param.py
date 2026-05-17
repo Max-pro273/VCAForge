@@ -1,97 +1,98 @@
 """
-CASTEP/cell_param.py  —  CASTEP file I/O, .param generation, and output parsing.
-════════════════════════════════════════════════════════════════════════════════
-No subprocess calls (except cif2cell), no user interaction.
+CASTEP/cell_param.py  —  CASTEP file I/O, .param generation, output parsing.
+═══════════════════════════════════════════════════════════════════════════════
+Pure functions. No subprocesses, no user interaction. Vegard scaling is NOT
+performed here — that is the responsibility of crystal_modes.VCAStrategy.
 """
 
 from __future__ import annotations
 
 import re
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import config as _cfg
-import numpy as np
 from core_physics import Crystal
-from engines.engine import EngineResult, _try_float, read_tail
+from engines.engine import EngineResult, read_tail, try_float
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Symmetry block
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def format_castep_symmetry_block(crystal: Crystal) -> str:
-    """
-    Formats mathematical symmetry operations into strict CASTEP %BLOCK syntax.
+    """Format crystal symmetry into CASTEP %BLOCK SYMMETRY_OPS syntax.
+
     Requests Cartesian rotations because VCAForge writes %BLOCK LATTICE_CART.
     """
-    # Request Cartesian rotations for CASTEP compatibility
-    rotations, translations = crystal.get_symmetry_operations(cartesian_rotations=True)
+    rotations, translations = crystal.get_symmetry_operations(
+        cartesian_rotations=True
+    )
 
     lines = ["\n%BLOCK SYMMETRY_OPS"]
     for i, (r, t) in enumerate(zip(rotations, translations), 1):
         lines.append(f"# Symm. op. {i}")
         for row in r:
-            # Exact spacing match to cif2cell
-            lines.append(f"  {row[0]: 17.15f}   {row[1]: 17.15f}   {row[2]: 17.15f} ")
+            lines.append(
+                f"  {row[0]: 17.15f}   {row[1]: 17.15f}   {row[2]: 17.15f} "
+            )
         lines.append(f"  {t[0]: 17.15f}   {t[1]: 17.15f}   {t[2]: 17.15f} ")
-
     lines.append("%ENDBLOCK SYMMETRY_OPS\n")
     return "\n".join(lines)
 
 
-def write_vca_cell(
+# ─────────────────────────────────────────────────────────────────────────────
+# .cell writer  (no Vegard — strategy already did it)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def write_castep_cell(
     dest: Path,
     crystal: Crystal,
-    template_element: str,
-    target_mix: dict[str, float],
-    *,
-    occ: float = 1.0,
-    vegard: bool = True,
 ) -> None:
-    """Generates .cell file from Crystal object natively. Strict 15-decimal precision."""
-    L = crystal.lattice.copy()
-    eps = 1e-9
-    nonzero_mix = {e: f for e, f in target_mix.items() if f > eps}
+    """Write a CASTEP .cell file. The crystal is written verbatim — Vegard
+    scaling, if applicable, was applied upstream by VCAStrategy.
 
-    if vegard and len(nonzero_mix) > 1:
-        r_template = _cfg.ELEMENTS.get(template_element.capitalize(), {}).get(
-            "rad", 0.0
-        )
-        r_mix = sum(
-            _cfg.ELEMENTS.get(e.capitalize(), {}).get("rad", 0.0) * f
-            for e, f in nonzero_mix.items()
-        )
-        if r_template > 1e-6 and r_mix > 1e-6:
-            L *= r_mix / r_template
-
+    Site decoration rules:
+      • Template sublattice with len(target_mix)==1 → single species, no MIXTURE:.
+      • Template sublattice with len(target_mix)>1  → MIXTURE:( 1 frac ) per species.
+      • Non-template sublattice: written as-is, unless occ < 1.0 and species is a
+        non-metal (config.ELEMENTS[sym]["nonmetal"]=True), in which case it gets
+        a partial-occupancy MIXTURE tag.
+    """
     lines = [
-        f"# VCAForge v{_cfg.VERSION}  mix={list(target_mix.keys())}  tmpl={template_element}\n",
+        f"# VCAForge v{_cfg.VERSION} Crystal-centric model\n",
         "%BLOCK LATTICE_CART\nANG\n",
     ]
-    for vec in L:
-        lines.append(f"  {vec[0]:20.15f}  {vec[1]:20.15f}  {vec[2]:20.15f}\n")
+    for vec in crystal.lattice:
+        lines.append(
+            f"  {vec[0]:20.15f}  {vec[1]:20.15f}  {vec[2]:20.15f}\n"
+        )
     lines.append("%ENDBLOCK LATTICE_CART\n\n%BLOCK POSITIONS_FRAC\n")
 
-    for sp, fc in zip(crystal.species, crystal.frac_coords):
-        if sp.lower() == template_element.lower():
-            if len(nonzero_mix) == 1:
+    for i, site in enumerate(crystal.sites):
+        fc = crystal.frac_coords[i]
+        if len(site) > 1:
+            # VCA site
+            for species, fraction in site.items():
                 lines.append(
-                    f"  {next(iter(nonzero_mix)):2}   {fc[0]:20.15f}   {fc[1]:20.15f}   {fc[2]:20.15f}\n"
+                    f"  {species:2}   {fc[0]:20.15f}   {fc[1]:20.15f}   "
+                    f"{fc[2]:20.15f}  MIXTURE:( 1 {fraction:.8f})\n"
                 )
-            else:
-                for mix_el, mix_frac in nonzero_mix.items():
-                    lines.append(
-                        f"  {mix_el:2}   {fc[0]:20.15f}   {fc[1]:20.15f}   {fc[2]:20.15f}  MIXTURE:( 1 {mix_frac:.8f})\n"
-                    )
         else:
-            if occ < 1.0 - eps and _cfg.ELEMENTS.get(sp.capitalize(), {}).get(
-                "nonmetal"
-            ):
+            # Single species site
+            species, fraction = next(iter(site.items()))
+            if abs(fraction - 1.0) > 1e-8:
+                 # Partial occupancy non-VCA site
                 lines.append(
-                    f"  {sp:2}   {fc[0]:20.15f}   {fc[1]:20.15f}   {fc[2]:20.15f}  MIXTURE:( 1 {occ:.8f})\n"
+                    f"  {species:2}   {fc[0]:20.15f}   {fc[1]:20.15f}   "
+                    f"{fc[2]:20.15f}  MIXTURE:( 1 {fraction:.8f})\n"
                 )
             else:
                 lines.append(
-                    f"  {sp:2}   {fc[0]:20.15f}   {fc[1]:20.15f}   {fc[2]:20.15f}\n"
+                    f"  {species:2}   {fc[0]:20.15f}   {fc[1]:20.15f}   "
+                    f"{fc[2]:20.15f}\n"
                 )
 
     lines.append("%ENDBLOCK POSITIONS_FRAC\n")
@@ -99,27 +100,22 @@ def write_vca_cell(
     dest.write_text("".join(lines), encoding="utf-8")
 
 
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Param Generation
+# .param writer
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _scf_block(
-    xc: str,
-    cutoff: int,
-    spin: bool,
-    nextra: int,
-    smearing: float,
-    mix_amp: float,
-    *,
-    ncp: bool = False,
+    xc: str, cutoff: int, spin: bool, nextra: int,
+    smearing: float, mix_amp: float,
 ) -> str:
-    """Generates the base SCF configuration block."""
-    ncp_note = "  # NCP: raise cutoff >= 900 eV for C/N/O" if ncp else ""
     return (
         f"# VCAForge v{_cfg.VERSION}\n"
         f"xc_functional       : {xc}\n"
-        f"cut_off_energy      : {cutoff} eV{ncp_note}\n"
+        f"cut_off_energy      : {cutoff} eV\n"
         f"spin_polarized      : {'true' if spin else 'false'}\n\n"
         f"max_scf_cycles      : {_cfg.MAX_SCF}\n"
         f"metals_method       : {_cfg.METALS_METHOD}\n"
@@ -130,7 +126,7 @@ def _scf_block(
     )
 
 
-def write_engine_params(
+def write_castep_param(
     path: Path,
     task_type: str,
     xc: str,
@@ -138,16 +134,13 @@ def write_engine_params(
     spin: bool,
     nextra: int,
     smearing: float,
-    *,
-    ncp: bool = False,
 ) -> None:
-    """Generates a .param file from scratch for GeomOpt or SinglePoint."""
-
+    """Generate a .param file for GeomOpt, SinglePoint, or ElasticConstants."""
     is_geom = task_type == "GeometryOptimization"
     mix_amp = _cfg.MIX_AMP_GEOM if is_geom else _cfg.MIX_AMP_SP
     elec_tol = _cfg.ELEC_TOL_GEOM if is_geom else _cfg.ELEC_TOL_SP
 
-    body = _scf_block(xc, cutoff, spin, nextra, smearing, mix_amp, ncp=ncp)
+    body = _scf_block(xc, cutoff, spin, nextra, smearing, mix_amp)
     body += f"elec_energy_tol     : {elec_tol}\n\n"
     body += f"task                : {task_type}\n"
     body += "calculate_stress    : true\n\n"
@@ -173,8 +166,12 @@ def write_engine_params(
     path.write_text(body, encoding="utf-8")
 
 
+# Back-compat alias.
+write_engine_params = write_castep_param
+
+
 def patch_nextra(param_path: Path, nextra: int) -> None:
-    """Updates the nextra_bands value in an existing .param file."""
+    """Update nextra_bands in an existing .param file."""
     lines = param_path.read_text(encoding="utf-8").splitlines()
     replaced = False
     for i, line in enumerate(lines):
@@ -188,161 +185,128 @@ def patch_nextra(param_path: Path, nextra: int) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Output Parsing (CASTEP)
+# Output parsing
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def parse_output(output_file: Path) -> EngineResult:
-    """
-    Parses the .castep file from the bottom up to extract final physical metrics.
-    Includes advanced telemetry: Fermi energy, Max Force, Enthalpy, and Spin.
-    """
+def _extract_after_equals(line: str, unit: str = "") -> float | None:
+    """Helper: parse 'key = value [unit]' format."""
+    parts = line.split("=")
+    if len(parts) != 2:
+        return None
+    return try_float(parts[1].replace(unit, ""))
+
+
+def parse_castep_output(output_file: Path) -> EngineResult:
+    """Parse a .castep file. All non-standard fields land in extra_data."""
     if not output_file.exists():
         return EngineResult(warning=f"Output file missing: {output_file.name}")
 
-    # Read tail to avoid loading massive SCF histories into memory (last 2MB is plenty)
     text = read_tail(output_file, max_bytes=2 * 1024 * 1024)
     lines = text.splitlines()
 
-    energy_ev = None
-    volume_ang3 = None
-    density_gcm3 = None
-    run_time_s = None
-
+    energy_ev: float | None = None
+    volume_ang3: float | None = None
+    density_gcm3: float | None = None
+    run_time_s: float | None = None
     extra: dict[str, Any] = {}
 
-    # Read from the bottom up to grab the *final* optimized values
+    # Bottom-up scan to find FINAL values of all metrics.
     for line in reversed(lines):
-        # 1. Core Metrics
         if energy_ev is None and "Final energy, E" in line:
-            parts = line.split("=")
-            if len(parts) == 2:
-                energy_ev = _try_float(parts[1].replace("eV", ""))
-
+            energy_ev = _extract_after_equals(line, "eV")
         elif volume_ang3 is None and "Current cell volume" in line:
-            parts = line.split("=")
-            if len(parts) == 2:
-                volume_ang3 = _try_float(parts[1].replace("A**3", ""))
-
+            volume_ang3 = _extract_after_equals(line, "A**3")
         elif density_gcm3 is None and "Density" in line and "g/cm" in line:
-            parts = line.split("=")
-            if len(parts) == 2:
-                density_gcm3 = _try_float(parts[1].replace("g/cm**3", ""))
-
+            density_gcm3 = _extract_after_equals(line, "g/cm**3")
         elif run_time_s is None and "Total time" in line:
-            parts = line.split("=")
-            if len(parts) == 2:
-                run_time_s = _try_float(parts[1].replace("s", ""))
-
-        # 2. Advanced Physical Telemetry (Saved to extra_data)
+            run_time_s = _extract_after_equals(line, "s")
         elif "Final Enthalpy" in line and "enthalpy_eV" not in extra:
-            parts = line.split("=")
-            if len(parts) == 2:
-                extra["enthalpy_eV"] = _try_float(parts[1].replace("eV", ""))
-
+            v = _extract_after_equals(line, "eV")
+            if v is not None:
+                extra["enthalpy_eV"] = v
         elif "Fermi energy" in line and "fermi_ev" not in extra:
-            # Handles both "Fermi energy =" and "Fermi energy for spin 1 ="
-            parts = line.split("=")
-            if len(parts) == 2:
-                extra["fermi_ev"] = _try_float(parts[1].replace("eV", ""))
-
+            v = _extract_after_equals(line, "eV")
+            if v is not None:
+                extra["fermi_ev"] = v
         elif "Integrated Spin Density" in line and "mag_moment" not in extra:
-            parts = line.split("=")
-            if len(parts) == 2:
-                extra["mag_moment"] = _try_float(parts[1])
-
+            v = _extract_after_equals(line)
+            if v is not None:
+                extra["mag_moment"] = v
         elif "Peak Memory Use" in line and "peak_mem_mb" not in extra:
-            parts = line.split("=")
-            if len(parts) == 2:
-                mem_kb = _try_float(parts[1].replace("kB", ""))
-                if mem_kb is not None:
-                    extra["peak_mem_mb"] = round(mem_kb / 1024.0, 1)
-
+            kb = _extract_after_equals(line, "kB")
+            if kb is not None:
+                extra["peak_mem_mb"] = round(kb / 1024.0, 1)
         elif "Final free energy (E-TS)" in line and "free_energy_ev" not in extra:
-            parts = line.split("=")
-            if len(parts) == 2:
-                extra["free_energy_ev"] = _try_float(parts[1].replace("eV", ""))
-
+            v = _extract_after_equals(line, "eV")
+            if v is not None:
+                extra["free_energy_ev"] = v
         elif "est. 0K energy (E-0.5TS)" in line and "energy_0k_ev" not in extra:
-            parts = line.split("=")
-            if len(parts) == 2:
-                extra["energy_0k_ev"] = _try_float(parts[1].replace("eV", ""))
-
+            v = _extract_after_equals(line, "eV")
+            if v is not None:
+                extra["energy_0k_ev"] = v
         elif "Final bulk modulus" in line and "B_lbfgs_GPa" not in extra:
-            parts = line.split("=")
-            if len(parts) == 2:
-                extra["B_lbfgs_GPa"] = _try_float(parts[1].replace("GPa", ""))
-
+            v = _extract_after_equals(line, "GPa")
+            if v is not None:
+                extra["B_lbfgs_GPa"] = v
         elif "Pressure:" in line and "residual_pressure_GPa" not in extra:
-            # Беремо останній (фінальна геометрія)
             m = re.search(r"Pressure:\s*([-\d\.]+)", line)
             if m:
-                extra["residual_pressure_GPa"] = _try_float(m.group(1))
-
+                extra["residual_pressure_GPa"] = try_float(m.group(1))
         elif "Charge spilling" in line and "charge_spilling_pct" not in extra:
             m = re.search(r"=\s*([\d\.]+)%", line)
             if m:
-                extra["charge_spilling_pct"] = _try_float(m.group(1))
+                extra["charge_spilling_pct"] = try_float(m.group(1))
 
-    # Mulliken charges — для кожного унікального виду
-    mulliken_charges = {}
+    # ── Mulliken charges (N28 fix: take LAST occurrence, not first) ──────────
     m_mull = re.findall(
-        r"^\s+(\w+)\s+\d+\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s+([-\d\.]+)",
-        text,
-        re.M,
+        r"^\s+(\w+)\s+\d+\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s+"
+        r"[\d\.\-]+\s+([-\d\.]+)",
+        text, re.M,
     )
-    for species, charge in m_mull:
+    mulliken: dict[str, float | None] = {}
+    for species, charge in reversed(m_mull):
         key = f"mulliken_q_{species}"
-        if key not in mulliken_charges:
-            mulliken_charges[key] = _try_float(charge)
-    extra.update(mulliken_charges)
+        if key not in mulliken:
+            mulliken[key] = try_float(charge)
+    extra.update(mulliken)
 
-    # Bond populations — середнє та мін/макс
+    # ── Bond populations ──────────────────────────────────────────────────────
     m_bonds = re.findall(
-        r"^\s+\w+\s+\d+\s+--\s+\w+\s+\d+\s+([-\d\.]+)\s+([\d\.]+)", text, re.M
+        r"^\s+\w+\s+\d+\s+--\s+\w+\s+\d+\s+([-\d\.]+)\s+([\d\.]+)", text, re.M,
     )
     if m_bonds:
         pops = [float(p) for p, _ in m_bonds]
-        lens = [float(l) for _, l in m_bonds]
+        lens = [float(L) for _, L in m_bonds]
         extra["bond_population_avg"] = round(sum(pops) / len(pops), 4)
         extra["bond_length_avg_ang"] = round(sum(lens) / len(lens), 5)
 
-    # 3. Extract Max Force & BFGS steps via Regex Block
-    # Look for the last BFGS convergence block
+    # ── Max force ─────────────────────────────────────────────────────────────
     m_force = re.search(r"\|\s*Max force \(eV/A\)\s*\|\s*([\d\.]+)\s*\|", text)
     if m_force:
-        extra["fmax_ev_ang"] = _try_float(m_force.group(1))
+        extra["fmax_ev_ang"] = try_float(m_force.group(1))
 
-    # geom_converged: "yes" if LBFGS converged, "no" if it just ran out of iterations
+    # ── Geom convergence ──────────────────────────────────────────────────────
     if "LBFGS: finished iteration" in text:
-        if "Geometry optimization completed successfully" in text:
-            extra["geom_converged"] = "yes"
-        else:
-            extra["geom_converged"] = "no"
+        extra["geom_converged"] = (
+            "yes" if "Geometry optimization completed successfully" in text else "no"
+        )
 
-    # Look for Lattice Parameters (a, b, c) of the optimized cell
-    # We grab the last instance in the file (which is the final geometry)
+    # ── Final lattice parameters ──────────────────────────────────────────────
     m_lat = re.findall(
         r"a\s*=\s*([\d\.]+)\s+alpha\s*=\s*([\d\.]+)\s*\n\s*"
         r"b\s*=\s*([\d\.]+)\s+beta\s*=\s*([\d\.]+)\s*\n\s*"
         r"c\s*=\s*([\d\.]+)\s+gamma\s*=\s*([\d\.]+)",
-        text,
-        re.I,
+        text, re.I,
     )
     if m_lat:
-        last_lat = m_lat[-1]
-        extra["a_opt_ang"], extra["alpha"] = (
-            _try_float(last_lat[0]),
-            _try_float(last_lat[1]),
-        )
-        extra["b_opt_ang"], extra["beta"] = (
-            _try_float(last_lat[2]),
-            _try_float(last_lat[3]),
-        )
-        extra["c_opt_ang"], extra["gamma"] = (
-            _try_float(last_lat[4]),
-            _try_float(last_lat[5]),
-        )
+        a, al, b, be, c, ga = m_lat[-1]
+        extra["a_opt_ang"] = try_float(a)
+        extra["alpha"] = try_float(al)
+        extra["b_opt_ang"] = try_float(b)
+        extra["beta"] = try_float(be)
+        extra["c_opt_ang"] = try_float(c)
+        extra["gamma"] = try_float(ga)
 
     return EngineResult(
         energy_ev=energy_ev,
@@ -354,11 +318,21 @@ def parse_output(output_file: Path) -> EngineResult:
     )
 
 
+# Back-compat alias.
+parse_output = parse_castep_output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# .elastic file parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def parse_elastic_file(path: Path) -> dict[str, Any]:
-    """Читає .elastic файл без Regex."""
+    """Parse a CASTEP .elastic file via a state machine (no regex on numbers)."""
     if not path.exists():
         return {}
-    r: dict[str, Any] = {}
+
+    result: dict[str, Any] = {}
     in_cij = False
     cij_rows: list[list[float]] = []
 
@@ -370,7 +344,7 @@ def parse_elastic_file(path: Path) -> dict[str, Any]:
             continue
 
         if in_cij:
-            if not s or s.startswith("=") or s.startswith("-"):
+            if not s or s.startswith(("=", "-")):
                 if len(cij_rows) == 6:
                     in_cij = False
                 continue
@@ -382,31 +356,25 @@ def parse_elastic_file(path: Path) -> dict[str, Any]:
                     pass
             if len(cij_rows) == 6:
                 in_cij = False
-                keys = ["C11", "C12", "C13", "C22", "C23", "C33", "C44", "C55", "C66"]
-                indices = [
-                    (0, 0),
-                    (0, 1),
-                    (0, 2),
-                    (1, 1),
-                    (1, 2),
-                    (2, 2),
-                    (3, 3),
-                    (4, 4),
-                    (5, 5),
-                ]
+                keys = ["C11", "C12", "C13", "C22", "C23", "C33",
+                        "C44", "C55", "C66"]
+                indices = [(0, 0), (0, 1), (0, 2),
+                           (1, 1), (1, 2), (2, 2),
+                           (3, 3), (4, 4), (5, 5)]
                 for k, (i, j) in zip(keys, indices):
-                    r[k] = f"{cij_rows[i][j]:.4f}"
+                    result[k] = f"{cij_rows[i][j]:.4f}"
 
-        for label, col in [
+        for label, col in (
             ("Hill bulk modulus", "B_Hill_GPa"),
             ("Hill shear modulus", "G_Hill_GPa"),
             ("Young modulus", "E_GPa"),
             ("Poisson ratio", "nu"),
             ("Debye temperature", "T_Debye_K"),
             ("Vickers hardness", "H_Vickers_GPa"),
-        ]:
+        ):
             if label in line and "=" in line:
-                v = _try_float(line.split("=")[-1].strip().split()[0])
+                v = try_float(line.split("=")[-1].strip().split()[0])
                 if v is not None:
-                    r[col] = f"{v:.4f}"
-    return r
+                    result[col] = f"{v:.4f}"
+
+    return result

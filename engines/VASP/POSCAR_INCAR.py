@@ -1,62 +1,75 @@
 """
-VASP/POSCAR_INCAR.py  —  VASP File I/O and Parsing.
-════════════════════════════════════════════════════════════════
-Pure functions for generating POSCAR, INCAR, KPOINTS,
-and parsing OUTCAR. No state, no subprocesses.
+VASP/POSCAR_INCAR.py  —  VASP file I/O and OUTCAR parsing.
+═══════════════════════════════════════════════════════════════
+Pure functions: generate POSCAR/INCAR, parse OUTCAR.
+No state, no subprocesses, no engine logic.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 import config as _cfg
-import numpy as np
 from core_physics import Crystal
-from engines.engine import EngineResult, _try_float, read_tail
+from engines.engine import EngineResult, read_tail, try_float
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POSCAR
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def write_vca_poscar(
     dest: Path,
     crystal: Crystal,
-    template_element: str,
-    target_mix: dict[str, float],
 ) -> tuple[list[str], list[float]]:
-    L = crystal.lattice.copy()
-    eps = 1e-8
-    nonzero_mix = {e: f for e, f in target_mix.items() if f > eps}
+    """Write a VASP POSCAR; return (element_order, VCA_weights) for INCAR/POTCAR.
 
-    vca_coords = []
-    other_coords: dict[str, list[np.ndarray]] = {}
+    For VCA mode (sites with multiple species), every such site appears N times
+    in the POSCAR — once per mixed species. This function sorts all atoms
+    by species to create the correct POSCAR structure.
+    """
+    flat_atoms = []
+    for i, site in enumerate(crystal.sites):
+        coords = crystal.frac_coords[i]
+        for species, fraction in site.items():
+            flat_atoms.append({'species': species.capitalize(), 'coords': coords, 'fraction': fraction})
 
-    for sp, fc in zip(crystal.species, crystal.frac_coords):
-        if sp.lower() == template_element.lower():
-            vca_coords.append(fc)
-        else:
-            other_coords.setdefault(sp.capitalize(), []).append(fc)
+    # VASP requires atoms to be grouped by species in the POSCAR file.
+    flat_atoms.sort(key=lambda at: at['species'])
 
     ordered_elements = []
     element_counts = []
-    vca_weights = []
     final_coords = []
+    vca_weights = []
 
-    for mix_el, mix_frac in nonzero_mix.items():
-        ordered_elements.append(mix_el.capitalize())
-        element_counts.append(len(vca_coords))
-        vca_weights.append(mix_frac)
-        final_coords.extend(vca_coords)
+    if flat_atoms:
+        current_species = flat_atoms[0]['species']
+        count = 0
+        for atom in flat_atoms:
+            if atom['species'] == current_species:
+                count += 1
+            else:
+                if count > 0:
+                    ordered_elements.append(current_species)
+                    element_counts.append(count)
+                current_species = atom['species']
+                count = 1
+            final_coords.append(atom['coords'])
+            vca_weights.append(atom['fraction'])
 
-    for sp, coords in other_coords.items():
-        ordered_elements.append(sp)
-        element_counts.append(len(coords))
-        vca_weights.append(1.0)
-        final_coords.extend(coords)
+        if count > 0:
+            ordered_elements.append(current_species)
+            element_counts.append(count)
 
     lines = [
-        f"VCAForge mix={list(nonzero_mix.keys())} tmpl={template_element}",
+        f"VCAForge Crystal-centric model",
         "1.00000000000000",
     ]
-    for vec in L:
+    for vec in crystal.lattice:
         lines.append(f"  {vec[0]:20.15f}  {vec[1]:20.15f}  {vec[2]:20.15f}")
 
     lines.append("  " + "  ".join(ordered_elements))
@@ -70,26 +83,26 @@ def write_vca_poscar(
     return ordered_elements, vca_weights
 
 
-def write_engine_params(
+# ─────────────────────────────────────────────────────────────────────────────
+# INCAR
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def write_incar(
     path: Path,
     task_type: str,
-    xc: str,
+    *,
     cutoff: int,
     spin: bool,
     smearing: float,
-    *,
     vca_weights: list[float] | None = None,
     nelect: float | None = None,
     ncore: int = 0,
 ) -> None:
+    """Write an INCAR for GeometryOptimization, ElasticIBRION6, or SinglePoint."""
     is_geom = task_type == "GeometryOptimization"
     is_elastic = task_type in ("ElasticConstants", "ElasticIBRION6")
-
-    ediff = (
-        getattr(_cfg, "EDIFF_GEOM", "1E-5")
-        if is_geom
-        else getattr(_cfg, "EDIFF_IBRION6", "1E-7")
-    )
+    ediff = _cfg.EDIFF_GEOM if is_geom else _cfg.EDIFF_IBRION6
 
     lines = [
         f"# VCAForge INCAR - Task: {task_type}",
@@ -98,7 +111,7 @@ def write_engine_params(
         "LREAL  = Auto",
         f"ENCUT  = {cutoff}",
         f"EDIFF  = {ediff}",
-        f"ISMEAR = {getattr(_cfg, 'ISMEAR', 1)}",
+        f"ISMEAR = {_cfg.ISMEAR}",
         f"SIGMA  = {smearing:.4f}",
         f"ISPIN  = {2 if spin else 1}",
         "LWAVE  = .FALSE.",
@@ -106,76 +119,132 @@ def write_engine_params(
     ]
 
     if vca_weights and any(abs(w - 1.0) > 1e-6 for w in vca_weights):
-        lines.append(f"VCA    = " + " ".join(f"{w:.4f}" for w in vca_weights))
+        lines.append("VCA    = " + " ".join(f"{w:.4f}" for w in vca_weights))
     if nelect is not None:
         lines.append(f"NELECT = {nelect:.4f}")
 
     if is_geom:
-        lines.extend(
-            [
-                f"IBRION = {getattr(_cfg, 'IBRION_GEOM', 2)}",
-                f"ISIF   = {getattr(_cfg, 'ISIF', 3)}",
-                f"NSW    = {getattr(_cfg, 'NSW_MAX_VASP', 300)}",
-                f"EDIFFG = {getattr(_cfg, 'EDIFFG_VASP', '-0.01')}",
-            ]
-        )
+        lines.extend([
+            f"IBRION = {_cfg.IBRION_GEOM}",
+            f"ISIF   = {_cfg.ISIF}",
+            f"NSW    = {_cfg.NSW_MAX_VASP}",
+            f"EDIFFG = {_cfg.EDIFFG_VASP}",
+        ])
         if ncore > 0:
             lines.append(f"NCORE  = {ncore}")
     elif is_elastic:
-        lines.extend(
-            [
-                "IBRION = 6",
-                "ISIF   = 3",
-                "NSW    = 1",
-                "POTIM  = 0.015",
-                "NFREE  = 2",
-            ]
-        )
+        lines.extend([
+            "IBRION = 6", "ISIF   = 3", "NSW    = 1",
+            "POTIM  = 0.015", "NFREE  = 2",
+        ])
     else:
         lines.extend(["IBRION = -1", "NSW    = 0"])
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# Back-compat alias for existing callers — to be removed once vasp.py updated.
+write_engine_params = write_incar
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTCAR parsing — forward-scan state machine, all data in extra_data
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def parse_outcar(path: Path) -> EngineResult:
-    r = EngineResult()
+    """Parse a VASP OUTCAR. All engine-specific fields go in extra_data."""
     if not path.exists():
-        r.warning = "OUTCAR not found"
-        return r
+        return EngineResult(warning="OUTCAR not found")
 
     text = read_tail(path, max_bytes=5 * 1024 * 1024)
     lines = text.splitlines()
 
-    la = lb = lc = None
+    energy_ev: float | None = None
+    volume_ang3: float | None = None
+    run_time_s: float | None = None
+    extra: dict[str, Any] = {}
 
-    for i, line in enumerate(reversed(lines)):
-        s = line.strip()
+    # Forward scan — keep overwriting so the last (final) occurrence wins.
+    i = 0
+    while i < len(lines):
+        line = lines[i]
 
-        if not r.geom_converged and "Reached required accuracy" in line:
-            r.geom_converged = True
+        if "Reached required accuracy" in line:
+            extra["geom_converged"] = "yes"
 
-        if r.enthalpy_eV is None and "free  energy   TOTEN" in line:
-            r.enthalpy_eV = _try_float(line.split("=")[-1].strip().split()[0])
-            r.energy_ev = r.enthalpy_eV
+        if "free  energy   TOTEN" in line:
+            val = try_float(line.split("=")[-1].strip().split()[0])
+            if val is not None:
+                energy_ev = val
+                extra["enthalpy_eV"] = val
 
-        if r.volume_ang3 is None and "volume of cell :" in line:
-            r.volume_ang3 = _try_float(line.split(":")[1].strip().split()[0])
+        if "volume of cell :" in line:
+            volume_ang3 = try_float(line.split(":")[1].strip().split()[0])
 
-        if la is None and "length of vectors" in line:
+        # Lattice block: "length of vectors" header, then a line of three floats.
+        if "length of vectors" in line and i + 1 < len(lines):
+            parts = lines[i + 1].split()
+            if len(parts) >= 3:
+                a, b, c = (
+                    try_float(parts[0]),
+                    try_float(parts[1]),
+                    try_float(parts[2]),
+                )
+                if a and b and c:
+                    extra["a_opt_ang"] = a
+                    extra["b_opt_ang"] = b
+                    extra["c_opt_ang"] = c
+            i += 2
+            continue
+
+        if "Elapsed time" in line:
+            run_time_s = try_float(line.split(":")[-1].strip())
+
+        i += 1
+
+    # If geom_converged was never set, default to "no" only when the geom loop
+    # is known to have run (NSW > 0 implied by presence of "Iteration").
+    if "geom_converged" not in extra and any(
+        "Iteration" in ln for ln in lines[-50:]
+    ):
+        extra["geom_converged"] = "no"
+
+    return EngineResult(
+        energy_ev=energy_ev,
+        volume_ang3=volume_ang3,
+        run_time_s=run_time_s,
+        extra_data=extra,
+        warning=None if energy_ev is not None else "TOTEN not found in OUTCAR",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTCAR — IBRION=6 elastic tensor parser (called from vasp.py::run_elastic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def parse_ibrion6_tensor(text: str) -> np.ndarray | None:
+    """Parse VASP IBRION=6 elastic tensor (6x6) from OUTCAR text.
+
+    Returns the 6x6 stiffness matrix in GPa, or None if not found.
+    VASP reports the tensor in kBar; we convert to GPa (/10).
+    """
+    import re
+    m = re.search(
+        r"TOTAL ELASTIC MODULI \(kBar\)\s+Direction[^\n]+\n[^\n]+\n(.*?)(?:\n\s*\n|---)",
+        text, re.DOTALL,
+    )
+    if not m:
+        return None
+    rows = []
+    for line in m.group(1).splitlines():
+        parts = line.split()
+        if len(parts) >= 7:
             try:
-                parts = lines[len(lines) - 1 - i + 1].split()
-                if len(parts) >= 3:
-                    la, lb, lc = (
-                        _try_float(parts[0]),
-                        _try_float(parts[1]),
-                        _try_float(parts[2]),
-                    )
-                    if la and lb and lc:
-                        r.a_opt_ang, r.b_opt_ang, r.c_opt_ang = la, lb, lc
-            except IndexError:
+                rows.append([float(x) for x in parts[1:7]])
+            except ValueError:
                 pass
-
-        if r.run_time_s is None and "Elapsed time" in line:
-            r.run_time_s = _try_float(line.split(":")[-1].strip())
-
-    return r
+    if len(rows) >= 6:
+        return np.array(rows[:6]) / 10.0
+    return None

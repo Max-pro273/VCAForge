@@ -1,8 +1,10 @@
 """
-engines/CASTEP/castep.py  —  CASTEP Engine Implementation.
-═══════════════════════════════════════════════════════════
+engines/CASTEP/castep.py  —  CASTEP DFT engine.
+═══════════════════════════════════════════════════════════════
 Registered as "castep" via @register_engine decorator.
-Elastic strategy: finite-strain fallback driven by orchestrator.
+Elastic strategy: orchestrator-driven finite-strain fallback
+(FiniteStrainCapable). Recovery via .param patching (RecoveryCapable).
+Watchdog via SCF/Smax log inspection (WatchdogCapable).
 """
 
 from __future__ import annotations
@@ -15,35 +17,43 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import Any
+
+import numpy as np
 
 import config as _cfg
-import numpy as np
-from core_physics import Crystal, load_crystal
+from core_physics import Crystal, load_crystal, read_geometry, vec_for_system
 from engines.CASTEP.cell_param import (
+    parse_castep_output,
     parse_elastic_file,
-    parse_output,
     patch_nextra,
-    write_engine_params,
-    write_vca_cell,
+    write_castep_param,
+    write_castep_cell,
 )
 from engines.engine import (
     BaseEngine,
     EngineResult,
-    FiniteStrainCapable,
-    RecoveryCapable,
-    WatchdogCapable,
+    ProgressBar,
     read_tail,
     register_engine,
 )
 
-# Kill-reason constants
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kill-reason constants — CASTEP-specific.
+# Generic ones (TIMEOUT, CTRL_C) come from engines.engine.KillReason.
+# ─────────────────────────────────────────────────────────────────────────────
+
 _KR_SCF = "scf_nosconv"
 _KR_SMAX = "smax_stall"
-_KR_TIMEOUT = "timeout"
-_KR_STRESS = "geom_high_stress"
 
 
-def parse_smax_history(text: str) -> list[float]:
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_smax_history(text: str) -> list[float]:
     """Parse Smax (GPa) history from CASTEP LBFGS convergence lines."""
     smax: list[float] = []
     for ln in text.splitlines():
@@ -57,22 +67,33 @@ def parse_smax_history(text: str) -> list[float]:
     return smax
 
 
-def _nextra_bands(x: float, vec: float) -> int:
-    """Extra bands for elastic SCF."""
-    if x < 1e-5 or x > 1.0 - 1e-5:
-        return getattr(_cfg, "ELASTIC_NEXTRA_PURE", 10)
-    return getattr(_cfg, "ELASTIC_NEXTRA_BASE", 15) + int(abs(vec - 8.0) * 20)
+def _nextra_bands(crystal: Crystal) -> int:
+    """Extra bands heuristic — wider VCA → more bands needed."""
+    is_pure = all(len(site) == 1 for site in crystal.sites)
+    if is_pure:
+        return _cfg.ELASTIC_NEXTRA_PURE
+
+    vec = crystal.vec()
+    return _cfg.ELASTIC_NEXTRA_BASE + int(abs(vec - 8.0) * 20)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @register_engine("castep")
 class CastepEngine(BaseEngine):
-    """CASTEP DFT engine — finite-strain elastic fallback."""
+    """CASTEP DFT engine. Supports all crystal modes natively."""
 
     name = "castep"
     output_suffix = ".castep"
     subdir_name = _cfg.CASTEP_SUBDIR
     SUPPORTED_MODES = frozenset({"vca", "sqs", "direct"})
-    _cleanup_globs = getattr(_cfg, "CASTEP_CLEANUP_GLOBS", [])
+
+    @property
+    def _cleanup_globs(self) -> list[str]:
+        return _cfg.CASTEP_CLEANUP_GLOBS
 
     def __init__(self, engine_cmd: str, param_src: Path | str) -> None:
         self.engine_cmd = engine_cmd
@@ -87,67 +108,30 @@ class CastepEngine(BaseEngine):
         crystal: Crystal,
         override_cmd: str | None,
         args: argparse.Namespace,
-    ) -> tuple["CastepEngine", str]:
+    ) -> tuple[CastepEngine, str]:
         import ui
-
-        cpu = os.cpu_count() or 4
         ui.section("Engine execution (CASTEP)")
 
-        # Find binary using the unified BaseEngine method
-        bin_path = (
-            override_cmd
-            if override_cmd
-            else cls.find_resource(_cfg.CASTEP_SEARCH_PATHS, must_be_executable=True)
+        bin_path = cls._resolve_binary(
+            _cfg.CASTEP_SEARCH_PATHS, override_cmd, "castep"
+        )
+        n_procs = cls._resolve_mpi_procs(args)
+        cmd_template = (
+            f"{cls._build_mpi_cmd(bin_path, n_procs)} {{seed}}" if bin_path else ""
         )
 
-        while not bin_path:
-            print("  ⚠  CASTEP executable not found automatically.")
-            ans = ui.ask_str(
-                "  Provide absolute path to castep.mpi (or 'skip'): "
-            ).strip()
-            if ans.lower() == "skip":
-                bin_path = ""
-                break
-            bin_path = os.path.expanduser(ans)
-
-        if bin_path:
-            print(f"  ✓  Found executable: {bin_path}")
-
-        cores = getattr(args, "cores", None)
-        if cores is not None:
-            n = max(1, cores)
-            print(f"  MPI processes : {n}  (from --cores)")
-        else:
-            raw = ui.ask_str(f"  MPI processes [{cpu}]: ", str(cpu))
-            try:
-                n = max(1, int(raw))
-            except ValueError:
-                n = cpu
-
-        cmd = ""
-        if bin_path:
-            name = Path(bin_path).name
-            cmd = (
-                f"mpirun -n {n} {bin_path} {{seed}}"
-                if "mpi" in name.lower()
-                else f"{bin_path} {{seed}}"
-            )
-
-        # Build .param
-        species_list = list(dict.fromkeys(crystal.species))
         param_src = src.with_suffix(".param")
         if not param_src.exists():
-            schema = cls.get_wizard_schema(crystal, is_vca=True)
             ui.section("Parameter setup (CASTEP)")
-            answers = ui.render_wizard(schema)
+            answers = ui.render_wizard(cls.get_wizard_schema(crystal, is_vca=True))
 
-            has_d = any(
+            has_d_block = any(
                 _cfg.ELEMENTS.get(s.capitalize(), {}).get("Z", 0) > 20
-                for s in species_list
+                for s in dict.fromkeys(crystal.species)
             )
-            nextra = 20 if has_d else 10
+            nextra = 20 if has_d_block else 10
 
-            write_engine_params(
+            write_castep_param(
                 param_src,
                 task_type=answers["task"],
                 xc=answers["xc"],
@@ -160,114 +144,110 @@ class CastepEngine(BaseEngine):
         else:
             print(f"  .param : {param_src.name}  (found)")
 
-        return cls(cmd, param_src), cmd
+        return cls(cmd_template, param_src), cmd_template
 
-    # ── Wizard Schema ─────────────────────────────────────────────────────────
+    # ── Wizard schema ─────────────────────────────────────────────────────────
 
     @classmethod
-    def get_wizard_schema(cls, crystal: Crystal, is_vca: bool) -> list[dict]:
-        species = list(dict.fromkeys(crystal.species))
-        has_hard = any(
-            _cfg.ELEMENTS.get(s.capitalize(), {}).get("hard", False) for s in species
-        )
-        has_mag = any(
-            _cfg.ELEMENTS.get(s.capitalize(), {}).get("mag", False) for s in species
-        )
+    def get_wizard_schema(
+        cls, crystal: Crystal, is_vca: bool
+    ) -> list[dict[str, Any]]:
+        has_hard, has_mag = cls._detect_species_flags(crystal)
         rec_cut = _cfg.ENCUT_HARD if has_hard else _cfg.ENCUT_SOFT
-        rec_smear = (
-            _cfg.SMEARING_VCA if is_vca else getattr(_cfg, "SMEARING_SINGLE", 0.10)
-        )
+        rec_smear = _cfg.SMEARING_VCA if is_vca else _cfg.SMEARING_SINGLE
 
         return [
             {
-                "key": "task",
+                "key": "task", "type": "choice",
                 "label": "1/5  What calculation to run?",
-                "type": "choice",
                 "options": _cfg.TASKS_VCA if is_vca else _cfg.TASKS_FULL,
                 "default": "GeometryOptimization",
                 "help": "GeometryOptimization (relax) or SinglePoint (energy only)",
             },
             {
-                "key": "xc",
+                "key": "xc", "type": "choice",
                 "label": "2/5  Exchange-correlation functional",
-                "type": "choice",
                 "options": _cfg.XC_LIST,
                 "default": _cfg.XC_DEFAULT,
                 "help": "PBE (default) / PBEsol (best for ceramics) / LDA",
             },
             {
-                "key": "cutoff",
+                "key": "cutoff", "type": "int",
                 "label": "3/5  Plane-wave cutoff energy (eV)",
-                "type": "int",
                 "default": rec_cut,
-                "help": f"500-600 eV standard. {'⚠ Hard elements detected: 700+ eV required' if has_hard else ''}",
+                "help": (
+                    "500-600 eV standard. "
+                    + ("⚠ Hard elements detected: 700+ eV required" if has_hard else "")
+                ),
             },
             {
-                "key": "spin",
+                "key": "spin", "type": "bool",
                 "label": "4/5  Spin polarization",
-                "type": "bool",
                 "default": has_mag,
-                "help": f"{'⚠ Magnetic elements detected' if has_mag else 'Non-magnetic default'}",
+                "help": (
+                    "⚠ Magnetic elements detected" if has_mag else "Non-magnetic default"
+                ),
             },
             {
-                "key": "smearing",
+                "key": "smearing", "type": "float",
                 "label": "5/5  Fermi smearing width (eV)",
-                "type": "float",
                 "default": rec_smear,
                 "help": "0.10-0.20 eV — helps SCF convergence",
             },
         ]
 
-    # ── Core Engine Methods ───────────────────────────────────────────────────
+    # ── Core engine methods ───────────────────────────────────────────────────
 
     def write_input(
         self,
         dest_dir: Path,
         seed: str,
         crystal: Crystal,
-        species_mix: list[tuple[str, float]],
-        x: float,
-        template_element: str,
     ) -> None:
-        target_mix = {species_mix[0][0]: 1.0 - x}
-        for e, f in species_mix[1:]:
-            target_mix[e] = f * x
+        write_castep_cell(
+            dest_dir / f"{seed}.cell", crystal
+        )
 
-        scaled = crystal.with_vegard(template_element, target_mix)
-        write_vca_cell(dest_dir / f"{seed}.cell", scaled, template_element, target_mix)
         dest_param = dest_dir / f"{seed}.param"
         shutil.copy2(self.param_src, dest_param)
-        patch_nextra(dest_param, _nextra_bands(x, crystal.vec(species_mix)))
+        # Assuming x=0 for pure, x=1 for full mixture, and interpolating vec for VCA
+        # This is a simplification. The `x` is not available anymore.
+        # I'll use the VEC of the crystal.
+        patch_nextra(
+            dest_param, _nextra_bands(crystal)
+        )
 
     def parse_output(self, output_file: Path) -> EngineResult:
-        return parse_output(output_file)
+        return parse_castep_output(output_file)
 
-    def parse_extra_outputs(self, step_dir: Path, seed: str) -> dict:
+    def parse_extra_outputs(self, step_dir: Path, seed: str) -> dict[str, Any]:
         ep = step_dir / f"{seed}.elastic"
         return parse_elastic_file(ep) if ep.exists() else {}
 
     # ── WatchdogCapable ───────────────────────────────────────────────────────
 
     def check_health(self, log_tail: str) -> str | None:
-        """Analyzes CASTEP output tail. Returns a kill reason if stalled/dead."""
         if "Reached maximum number of SCF cycles" in log_tail:
             return _KR_SCF
-        smax = parse_smax_history(log_tail)
-        if len(smax) >= getattr(_cfg, "SMAX_STALL_ITERS", 8):
-            window = smax[-getattr(_cfg, "SMAX_STALL_ITERS", 8) :]
-            if min(window) > getattr(_cfg, "SMAX_KILL_GPa", 50.0):
+        smax = _parse_smax_history(log_tail)
+        window_size = _cfg.SMAX_STALL_ITERS
+        if len(smax) >= window_size:
+            window = smax[-window_size:]
+            if min(window) > _cfg.SMAX_KILL_GPa:
                 return _KR_SMAX
         return None
 
     # ── RecoveryCapable ───────────────────────────────────────────────────────
 
-    def patch_for_recovery(self, step_dir: Path, seed: str, error_type: str) -> bool:
+    def patch_for_recovery(
+        self, step_dir: Path, seed: str, error_type: str
+    ) -> bool:
+        """Patch .param to address SCF or stall errors. No-op for unknown errors."""
         param = step_dir / f"{seed}.param"
         if not param.exists():
             return False
-
-        apply_scf = error_type in {_KR_SCF, _KR_SMAX, _KR_TIMEOUT}
-        apply_stress = error_type == _KR_STRESS
+        if error_type not in {_KR_SCF, _KR_SMAX, "timeout"}:
+            return False
 
         lines = param.read_text(encoding="utf-8").splitlines()
         patched: list[str] = []
@@ -277,32 +257,25 @@ class CastepEngine(BaseEngine):
             kv = ln.split(":", 1)
             key = kv[0].strip().lower() if len(kv) == 2 else ""
 
-            if apply_scf and key == "smearing_width":
+            if key == "smearing_width":
                 patched.append("smearing_width      : 0.20 eV")
                 keys_done.add("smearing_width")
                 continue
-            if apply_scf and key == "mix_charge_amp":
+            if key == "mix_charge_amp":
                 patched.append("mix_charge_amp      : 0.05")
                 keys_done.add("mix_charge_amp")
                 continue
-            if apply_stress and key == "geom_stress_tol":
-                patched.append("geom_stress_tol     : 0.10 GPa")
-                keys_done.add("geom_stress_tol")
-                continue
             patched.append(ln)
 
-        if apply_scf:
-            if "smearing_width" not in keys_done:
-                patched.append("smearing_width      : 0.20 eV")
-            if "mix_charge_amp" not in keys_done:
-                patched.append("mix_charge_amp      : 0.05")
-        if apply_stress and "geom_stress_tol" not in keys_done:
-            patched.append("geom_stress_tol     : 0.10 GPa")
+        if "smearing_width" not in keys_done:
+            patched.append("smearing_width      : 0.20 eV")
+        if "mix_charge_amp" not in keys_done:
+            patched.append("mix_charge_amp      : 0.05")
 
         param.write_text("\n".join(patched) + "\n", encoding="utf-8")
         return True
 
-    def retry_schema(self) -> list[dict]:
+    def retry_schema(self) -> list[dict[str, str]]:
         return [
             {
                 "kill_reason": _KR_SCF,
@@ -315,22 +288,15 @@ class CastepEngine(BaseEngine):
                 "fix": "Increased smearing, reduced mix_amp.",
             },
             {
-                "kill_reason": _KR_TIMEOUT,
+                "kill_reason": "timeout",
                 "description": "Step timed out.",
                 "fix": "Increased smearing, reduced mix_amp.",
-            },
-            {
-                "kill_reason": _KR_STRESS,
-                "description": "Residual stress too high for elastic.",
-                "fix": "Relaxed geom_stress_tol to 0.10 GPa.",
             },
         ]
 
     # ── FiniteStrainCapable ───────────────────────────────────────────────────
 
     def load_optimised_crystal(self, step_dir: Path, seed: str) -> Crystal:
-        from core_physics import _read_raw
-
         orig_cell = step_dir / f"{seed}.cell"
         out_cell = step_dir / f"{seed}-out.cell"
 
@@ -340,11 +306,15 @@ class CastepEngine(BaseEngine):
         crystal = load_crystal(orig_cell)
 
         if out_cell.exists():
-            relaxed = _read_raw(out_cell)
+            # Use public read_geometry — no spglib standardization, preserves
+            # the orientation that the strain frame depends on.
+            relaxed = read_geometry(out_cell)
             crystal.lattice = relaxed.lattice
             crystal.clear_cache()
         else:
-            print(f"\n  [Warning] {out_cell.name} not found — using unrelaxed lattice.")
+            print(
+                f"\n  [Warning] {out_cell.name} not found — using unrelaxed lattice."
+            )
 
         return crystal
 
@@ -353,59 +323,49 @@ class CastepEngine(BaseEngine):
         dest_dir: Path,
         crystal: Crystal,
         seed: str,
-        species_mix: list[tuple[str, float]],
-        x: float,
         strain_voigt: np.ndarray,
     ) -> None:
         if not self.param_src.exists():
             raise FileNotFoundError(f"param_src not found: {self.param_src}")
 
-        tmpl_elem = species_mix[0][0]
-        target_mix = {tmpl_elem: 1.0 - x}
-        for e, f in species_mix[1:]:
-            target_mix[e] = f * x
-
+        # Voigt → deformation gradient F.
         e11, e22, e33 = strain_voigt[0], strain_voigt[1], strain_voigt[2]
-        e23, e13, e12 = strain_voigt[3] / 2, strain_voigt[4] / 2, strain_voigt[5] / 2
-        F = np.array(
-            [
-                [1 + e11, e12, e13],
-                [e12, 1 + e22, e23],
-                [e13, e23, 1 + e33],
-            ]
-        )
+        e23 = strain_voigt[3] / 2
+        e13 = strain_voigt[4] / 2
+        e12 = strain_voigt[5] / 2
+        F = np.array([
+            [1 + e11, e12, e13],
+            [e12, 1 + e22, e23],
+            [e13, e23, 1 + e33],
+        ])
 
-        strained_crystal = Crystal(
+        strained = Crystal(
             lattice=crystal.lattice @ F.T,
             frac_coords=crystal.frac_coords,
-            species=crystal.species,
+            sites=crystal.sites,
         )
 
-        write_vca_cell(
-            dest_dir / f"{seed}.cell",
-            strained_crystal,
-            tmpl_elem,
-            target_mix,
-            vegard=False,
+        write_castep_cell(
+            dest_dir / f"{seed}.cell", strained
         )
 
+        # Reuse XC and cutoff from the master .param; rewrite as SinglePoint.
         param_text = self.param_src.read_text(encoding="utf-8", errors="replace")
         m_xc = re.search(r"xc_functional\s*:\s*(\S+)", param_text, re.I)
         m_cut = re.search(r"cut_off_energy\s*:\s*(\d+)", param_text, re.I)
-
         if not m_xc or not m_cut:
             raise ValueError(
                 f"Missing xc_functional or cut_off_energy in {self.param_src}"
             )
 
-        write_engine_params(
+        write_castep_param(
             dest_dir / f"{seed}.param",
             task_type="SinglePoint",
             xc=m_xc.group(1),
             cutoff=int(m_cut.group(1)),
             spin=False,
-            nextra=_nextra_bands(x, crystal.vec(species_mix)),
-            smearing=getattr(_cfg, "SMEARING_SINGLE", 0.1),
+            nextra=_nextra_bands(crystal),
+            smearing=_cfg.SMEARING_SINGLE,
         )
 
     def parse_stress_tensor(self, output_file: Path) -> np.ndarray:
@@ -414,24 +374,25 @@ class CastepEngine(BaseEngine):
 
         text = read_tail(output_file, max_bytes=2 * 1024 * 1024)
 
+        # Prefer the geom-opt stress block (3 rows of (sx,sy,sz) <-- S).
         geomopt_blocks = re.findall(
             r"^\s*([-+]?\d+\.\d+[Ee][+-]?\d+)\s+"
             r"([-+]?\d+\.\d+[Ee][+-]?\d+)\s+"
             r"([-+]?\d+\.\d+[Ee][+-]?\d+)\s+<-- S",
-            text,
-            re.M,
+            text, re.M,
         )
         if len(geomopt_blocks) >= 3:
             m = np.array([[float(v) for v in r] for r in geomopt_blocks[-3:]])
-            return np.array([m[0, 0], m[1, 1], m[2, 2], m[1, 2], m[0, 2], m[0, 1]])
+            return np.array([m[0, 0], m[1, 1], m[2, 2],
+                             m[1, 2], m[0, 2], m[0, 1]])
 
+        # Fallback: Symmetrised Stress Tensor block from SinglePoint output.
         sp_blocks = re.findall(
             r"Symmetrised Stress Tensor.*?"
             r"\*\s+x\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*\*\s*"
             r"\*\s+y\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*\*\s*"
             r"\*\s+z\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s+([-+]?\d+\.\d+)\s*\*",
-            text,
-            re.S,
+            text, re.S,
         )
         if sp_blocks:
             v = [float(val) for val in sp_blocks[-1]]
@@ -439,55 +400,45 @@ class CastepEngine(BaseEngine):
 
         raise ValueError("Stress tensor not found in CASTEP output.")
 
-    # ── Progress Monitor ──────────────────────────────────────────────────────
+    # ── Progress monitor (uses shared ProgressBar) ────────────────────────────
 
-    def progress_monitor(self, proc: subprocess.Popen, stop: threading.Event) -> None:
+    def progress_monitor(
+        self,
+        proc: subprocess.Popen,
+        stop: threading.Event,
+        cwd: Path,
+    ) -> None:
+        # Drain stdout so the pipe never blocks.
         if proc.stdout is not None:
             threading.Thread(
-                target=lambda: [_ for _ in iter(proc.stdout.readline, b"")], daemon=True
+                target=lambda: [_ for _ in iter(proc.stdout.readline, b"")],
+                daemon=True,
             ).start()
 
-        cwd_path: Path | None = getattr(proc, "_cwd", None)
-        t0 = time.time()
-        geo, geo_seen = 0, 0
-        scf, scf_seen = 0, 0
+        bar = ProgressBar()
+        geo = scf = scf_seen = 0
         last_size = 0
         castep_file: Path | None = None
 
-        def _render() -> None:
-            width = shutil.get_terminal_size().columns or 80
-            scf_denom = max(scf_seen + 2, 5)
-            pct = min(100, int(scf * 100 / scf_denom))
-            filled = pct * 30 // 100
-            bar = "█" * filled + "░" * (30 - filled)
-            el = int(time.time() - t0)
-            mm, ss_v = divmod(el, 60)
-            scf_str = f"{scf}/{scf_seen}" if scf_seen >= 1 else f"{scf}/—"
+        # Discover the .castep file (it may not exist yet).
+        deadline = time.monotonic() + 15.0
+        while not stop.is_set() and time.monotonic() < deadline:
+            candidates = list(cwd.glob("*.castep"))
+            if candidates:
+                castep_file = max(candidates, key=lambda p: p.stat().st_mtime)
+                break
+            time.sleep(0.5)
 
-            line = f"  │  [{bar}] {pct:3d}%  geo {geo}  scf {scf_str}  ⏱ {mm:02d}:{ss_v:02d}"
-            if len(line) > width - 1:
-                line = line[: width - 4] + "..."
-            print(f"\r{line.ljust(width - 1)}", end="", flush=True)
+        try:
+            while not stop.is_set():
+                if castep_file is None or not castep_file.exists():
+                    bar.render(f"waiting for .castep file...   ⏱ {bar.elapsed()}")
+                    time.sleep(1.0)
+                    continue
 
-        if cwd_path is not None:
-            deadline = time.monotonic() + 15.0
-            while not stop.is_set() and time.monotonic() < deadline:
-                candidates = list(cwd_path.glob("*.castep"))
-                if candidates:
-                    castep_file = max(candidates, key=lambda p: p.stat().st_mtime)
-                    break
-                time.sleep(0.5)
-
-        while not stop.is_set():
-            if castep_file is None or not castep_file.exists():
-                _render()
-                time.sleep(1.0)
-                continue
-
-            try:
                 size = castep_file.stat().st_size
                 if size == last_size:
-                    _render()
+                    bar.render(self._fmt_progress(bar, geo, scf, scf_seen))
                     time.sleep(0.8)
                     continue
 
@@ -499,7 +450,6 @@ class CastepEngine(BaseEngine):
                         parts = line.split()
                         try:
                             geo = int(parts[parts.index("iteration") + 1])
-                            geo_seen = max(geo_seen, geo)
                             scf = 0
                         except (ValueError, IndexError):
                             pass
@@ -511,15 +461,14 @@ class CastepEngine(BaseEngine):
                                 scf_seen = max(scf_seen, scf)
                             except ValueError:
                                 pass
-                _render()
+                bar.render(self._fmt_progress(bar, geo, scf, scf_seen))
                 time.sleep(0.8)
-            except FileNotFoundError:
-                time.sleep(0.5)
-            except Exception:
-                time.sleep(1.0)
+        finally:
+            ProgressBar.clear()
 
-        print(
-            "\r" + " " * (shutil.get_terminal_size().columns or 80),
-            end="\r",
-            flush=True,
-        )
+    @staticmethod
+    def _fmt_progress(bar: ProgressBar, geo: int, scf: int, scf_seen: int) -> str:
+        scf_denom = max(scf_seen + 2, 5)
+        pct = min(1.0, scf / scf_denom)
+        scf_str = f"{scf}/{scf_seen}" if scf_seen else f"{scf}/—"
+        return f"[{bar.bar(pct)}] {int(pct * 100):3d}%  geo {geo}  scf {scf_str}  ⏱ {bar.elapsed()}"

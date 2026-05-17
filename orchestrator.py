@@ -1,507 +1,672 @@
-"""
-orchestrator.py  —  Run state, persistence, CSV, subprocess execution.
-════════════════════════════════════════════════════════════════════════
-RunState / Step  — data model + crash-safe JSON persistence
-execute_step     — engine-agnostic: runs one DFT job, parses results
-write_csv        — live CSV export
-mixing_enthalpy  — ΔH_mix from completed steps
-
-Watchdog
-────────
-``run_process`` embeds a :class:`_Watchdog` that monitors the engine output
-while the subprocess runs and kills it automatically when:
-  1. Wall-clock elapsed > ``config.STEP_TIMEOUT_S`` (default 1800 s).
-  2. If the engine is WatchdogCapable, it delegates health checks to:
-     `engine.check_health(log_tail) -> str | None`.
-     The orchestrator DOES NOT parse regexes or specific engine errors.
-
-Engine contract
-───────────────
-All engine-specific logic is in the engine class. Orchestrator detects
-capabilities ONLY via isinstance() — no ``hasattr()`` or ``engine.name ==``.
-
-Elastic routing:
-  isinstance(engine, ElasticCapable)
-      → True:  engine handles it entirely (e.g. VASP IBRION=6)
-      → False: orchestrator runs finite-strain loop using FiniteStrainCapable.
-"""
 
 from __future__ import annotations
 
-import csv
-import json
 import os
 import signal
 import subprocess
 import threading
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from abc import ABC, abstractmethod
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 import config
-from core_physics import Crystal
+from core_physics import Crystal, fit_cij_universal, generate_strain_steps
+from crystal_modes import get_strategy
 from engines.engine import (
-    BaseEngine,
     ElasticCapable,
     FiniteStrainCapable,
+    InProcessCapable,
+    InProcessElasticCapable,
+    KillReason,
     WatchdogCapable,
     read_tail,
 )
+from runstate import (
+    DONE,
+    FAILED,
+    PENDING,
+    RUNNING,
+    SKIPPED,
+    StateIO,
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Status constants
-# ─────────────────────────────────────────────────────────────────────────────
-
-PENDING = "pending"
-RUNNING = "running"
-DONE = "done"
-SKIPPED = "skipped"
-FAILED = "failed"
-
-STATUS_ICON: dict[str, str] = {
-    DONE: "✓",
-    SKIPPED: "⊘",
-    FAILED: "✗",
-    PENDING: "·",
-    RUNNING: "▶",
-}
-
-_KR_TIMEOUT = "timeout"
-_KR_CTRL_C = "ctrl-c"
+if TYPE_CHECKING:
+    from engines.engine import BaseEngine
+    from runstate import RunState, Step
 
 
-class IncompatibleMode(Exception):
-    """Raised when the chosen engine does not support the requested crystal mode."""
+def _load_mlip_relaxed_crystal(step_dir: Path) -> Crystal | None:
+    """Load the relaxed Crystal saved by MlipEngine.run_in_process.
 
+    MlipEngine writes three .npy files after a successful GeomOpt:
+      relaxed_cell.npy   — (3,3) cell matrix in Å
+      relaxed_pos.npy    — (N,3) fractional coordinates
+      relaxed_nums.npy   — (N,) atomic numbers (int)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data model
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@dataclass
-class Step:
-    """One concentration point in a VCA/SQS sweep, or a single-compound run."""
-
-    idx: int
-    concentration: float
-    status: str = PENDING
-    step_dir: str = ""
-    started_at: str = ""
-    finished_at: str = ""
-    rc: str = ""
-    parsed: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def enthalpy_eV(self) -> str:
-        return str(self.parsed.get("enthalpy_eV", ""))
-
-    @property
-    def a_opt_ang(self) -> str:
-        return str(self.parsed.get("a_opt_ang", ""))
-
-    @property
-    def wall_time_s(self) -> str:
-        return str(self.parsed.get("wall_time_s", ""))
-
-    @property
-    def geom_converged(self) -> str:
-        return str(self.parsed.get("geom_converged", ""))
-
-    @property
-    def warnings(self) -> str:
-        return str(self.parsed.get("warnings", ""))
-
-    def to_dict(self) -> dict[str, Any]:
-        base = {
-            "step": self.idx,
-            "concentration": self.concentration,
-            "status": self.status,
-            "step_dir": self.step_dir,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "rc": self.rc,
-        }
-        base.update(self.parsed)
-        return base
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Step":
-        known = {
-            "idx",
-            "step",
-            "concentration",
-            "status",
-            "step_dir",
-            "started_at",
-            "finished_at",
-            "rc",
-            "parsed",
-        }
-        parsed = dict(d.get("parsed") or {})
-        parsed.update({k: v for k, v in d.items() if k not in known})
-        return cls(
-            idx=d.get("step", d.get("idx", 0)),
-            concentration=d.get("concentration", 0.0),
-            status=d.get("status", PENDING),
-            step_dir=d.get("step_dir", ""),
-            started_at=d.get("started_at", ""),
-            finished_at=d.get("finished_at", ""),
-            rc=d.get("rc", ""),
-            parsed=parsed,
-        )
-
-
-@dataclass
-class RunState:
-    """Complete, serialisable state of one VCAForge run."""
-
-    version: str
-    seed: str
-    proj_dir: Path
-    template_element: str
-    species: list[tuple[str, float]]
-    engine_cmd: str
-    c_start: float
-    c_end: float
-    n_steps: int
-    created_at: str
-    single_mode: bool = False
-    nonmetal: str = ""
-    nonmetal_occ: float = 1.0
-    run_elastic: bool = False
-    engine_kwargs: dict[str, Any] = field(default_factory=dict)
-    crystal_mode: str = "vca"
-    engine_name: str = ""
-    steps: list[Step] = field(default_factory=list)
-
-    @property
-    def species_a(self) -> str:
-        return self.species[0][0] if self.species else ""
-
-    @property
-    def species_b(self) -> str:
-        return self.species[1][0] if len(self.species) > 1 else ""
-
-    @property
-    def n_done(self) -> int:
-        return sum(1 for s in self.steps if s.status == DONE)
-
-    @property
-    def n_pending(self) -> int:
-        return sum(1 for s in self.steps if s.status == PENDING)
-
-    @property
-    def n_failed(self) -> int:
-        return sum(1 for s in self.steps if s.status == FAILED)
-
-    def system_label(self) -> str:
-        if self.single_mode:
-            return self.seed
-        sp = self.species
-        nm = self.nonmetal
-        if len(sp) == 2:
-            metal = f"{sp[0][0]}(1-x){sp[1][0]}(x)"
-        else:
-            inner = "".join(f"{e}{f:.2f}" for e, f in sp[1:])
-            metal = f"{sp[0][0]}(1-x)[{inner}](x)"
-        return f"{metal}{nm}" if nm else metal
-
-    def to_json(self) -> dict[str, Any]:
-        d = asdict(self)
-        d["proj_dir"] = str(self.proj_dir)
-        d["engine_cmd"] = self.engine_cmd
-        d["engine_kwargs"] = self.engine_kwargs
-        d["crystal_mode"] = self.crystal_mode
-        d["engine_name"] = self.engine_name
-        d["steps"] = [s.to_dict() for s in self.steps]
-        return d
-
-    @classmethod
-    def from_json(cls, d: dict[str, Any], proj_dir: Path) -> "RunState":
-        raw_species = d.get("species")
-        if raw_species is None:
-            sa = d.get("species_a", "")
-            sb = d.get("species_b", "")
-            raw_species = [(sa, 0.0), (sb, 1.0)] if sa and sb else [(sa, 0.0)]
-        tmpl = d.get("template_element") or (raw_species[0][0] if raw_species else "")
-        cmd = d.get("engine_cmd") or d.get("castep_cmd", "")
-        return cls(
-            version=d.get("version", "?"),
-            seed=d["seed"],
-            proj_dir=proj_dir,
-            template_element=tmpl,
-            species=raw_species,
-            engine_cmd=cmd,
-            c_start=d.get("c_start", 0.0),
-            c_end=d.get("c_end", 1.0),
-            n_steps=d.get("n_steps", 0),
-            created_at=d.get("created_at", ""),
-            single_mode=d.get("single_mode", False),
-            nonmetal=d.get("nonmetal", ""),
-            nonmetal_occ=d.get("nonmetal_occ", 1.0),
-            run_elastic=d.get("run_elastic", False),
-            engine_kwargs=d.get("engine_kwargs", {}),
-            crystal_mode=d.get("crystal_mode", "vca"),
-            engine_name=d.get("engine_name", ""),
-            steps=[Step.from_dict(s) for s in d.get("steps", [])],
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Persistence
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _state_path(proj_dir: Path) -> Path:
-    return proj_dir / config.STATE_FILE
-
-
-def save_run(state: RunState) -> None:
-    """Atomically persist *state* to JSON (write-then-rename)."""
-    dst = _state_path(state.proj_dir)
-    tmp = dst.with_suffix(".json.tmp")
-    tmp.write_text(
-        json.dumps(state.to_json(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    tmp.replace(dst)
-
-
-def load_run(proj_dir: Path) -> RunState | None:
-    f = _state_path(proj_dir)
-    if not f.exists():
+    Returns None if the files are absent (non-MLIP engine, or failed run),
+    so callers can fall back to the pre-relaxation Crystal without crashing.
+    """
+    cell_f = step_dir / "relaxed_cell.npy"
+    pos_f  = step_dir / "relaxed_pos.npy"
+    nums_f = step_dir / "relaxed_nums.npy"
+    if not (cell_f.exists() and pos_f.exists() and nums_f.exists()):
         return None
     try:
-        return RunState.from_json(json.loads(f.read_text(encoding="utf-8")), proj_dir)
-    except (json.JSONDecodeError, KeyError):
-        return None
+        import ase.data
+        cell = np.load(cell_f)
+        pos  = np.load(pos_f)
+        nums = np.load(nums_f).astype(int)
+        symbols = [ase.data.chemical_symbols[z] for z in nums]
+        sites   = [{s: 1.0} for s in symbols]
+        return Crystal(lattice=cell, frac_coords=pos, sites=sites)
+    except Exception:
+        return None  # non-fatal — caller falls back to pre-relaxation crystal
 
 
-def new_run(
-    *,
-    seed: str,
-    proj_dir: Path,
-    template_element: str,
-    species: list[tuple[str, float]],
-    engine_cmd: str,
-    engine_name: str = "",
-    c_start: float,
-    c_end: float,
-    n_steps: int,
-    single_mode: bool = False,
-    nonmetal: str = "",
-    nonmetal_occ: float = 1.0,
-    run_elastic: bool = False,
-    engine_kwargs: dict[str, Any] | None = None,
-    crystal_mode: str = "vca",
-) -> RunState:
-    proj_dir.mkdir(parents=True, exist_ok=True)
-    if single_mode:
-        steps = [Step(idx=0, concentration=0.0)]
-    else:
-        d = (c_end - c_start) / max(n_steps, 1)
-        steps = [
-            Step(
-                idx=i,
-                concentration=round(c_end if i == n_steps else c_start + i * d, 10),
-            )
-            for i in range(n_steps + 1)
-        ]
-    state = RunState(
-        version=config.VERSION,
-        seed=seed,
-        proj_dir=proj_dir,
-        template_element=template_element,
-        species=species,
-        engine_cmd=engine_cmd,
-        c_start=c_start,
-        c_end=c_end,
-        n_steps=n_steps,
-        created_at=_now(),
-        single_mode=single_mode,
-        nonmetal=nonmetal,
-        nonmetal_occ=nonmetal_occ,
-        run_elastic=run_elastic,
-        engine_kwargs=engine_kwargs or {},
-        crystal_mode=crystal_mode,
-        engine_name=engine_name,
-        steps=steps,
-    )
-    save_run(state)
-    return state
+class Task(ABC):
+    """A single task to be executed by the orchestrator."""
 
+    def __init__(self, state: "RunState", step: "Step", engine: "BaseEngine", crystal: "Crystal"):
+        self.state = state
+        self.step = step
+        self.engine = engine
+        self.crystal = crystal
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CSV export
-# ─────────────────────────────────────────────────────────────────────────────
+    @abstractmethod
+    def execute(self) -> bool:
+        """Execute the task and return a result."""
+        raise NotImplementedError
 
-_CSV_FIXED = [
-    "step",
-    "concentration",
-    "status",
-    "started_at",
-    "finished_at",
-    "wall_time_s",
-    "elastic_wall_time_s",
-    "total_wall_time_s",
-]
+    def _build_target_mix(
+        self, species: list[tuple[str, float]], x: float,
+    ) -> dict[str, float]:
+        """Convert state.species + x → per-species fraction on the template
+        sublattice. species[0] phases out as x → 1."""
+        mix = {species[0][0]: 1.0 - x}
+        for e, f in species[1:]:
+            mix[e] = f * x
+        return mix
 
-_CSV_ORDER = [
-    # ── Structure ──────────────────────────────────────────────────────────────
-    "concentration",
-    "VEC",
-    "a_opt_ang",
-    "b_opt_ang",
-    "c_opt_ang",
-    "a_prim_ang",
-    "alpha",
-    "beta",
-    "gamma",
-    "volume_ang3",
-    "density_gcm3",
-    # ── Energetics ─────────────────────────────────────────────────────────────
-    "energy_ev",
-    "free_energy_ev",
-    "energy_0k_ev",
-    "enthalpy_eV",
-    "dH_mix_meV_per_fu",
-    # ── Electronic ─────────────────────────────────────────────────────────────
-    "fermi_ev",
-    "mag_moment",
-    "charge_spilling_pct",
-    "mulliken_q_C",
-    "mulliken_q_N",
-    "mulliken_q_O",
-    "mulliken_q_Ti",
-    "mulliken_q_Zr",
-    "mulliken_q_Nb",
-    "mulliken_q_V",
-    "mulliken_q_Hf",
-    "mulliken_q_Mo",
-    "bond_population_avg",
-    "bond_length_avg_ang",
-    # ── Mechanical (elastic) ───────────────────────────────────────────────────
-    "B_lbfgs_GPa",
-    "C11",
-    "C12",
-    "C44",
-    "B_Voigt_GPa",
-    "B_Reuss_GPa",
-    "B_Hill_GPa",
-    "G_Voigt_GPa",
-    "G_Reuss_GPa",
-    "G_Hill_GPa",
-    "E_GPa",
-    "nu",
-    "Zener_A",
-    "Pugh_ratio",
-    "Cauchy_pressure_GPa",
-    "C_prime_GPa",
-    "Kleinman_zeta",
-    "lambda_Lame_GPa",
-    "mu_Lame_GPa",
-    "H_Vickers_GPa",
-    "born_stable",
-    # ── Acoustic / Thermal ────────────────────────────────────────────────────
-    "v_longitudinal_ms",
-    "v_transverse_ms",
-    "v_mean_ms",
-    "T_Debye_K",
-    "acoustic_Gruneisen",
-    # ── Convergence / QC ──────────────────────────────────────────────────────
-    "residual_pressure_GPa",
-    "fmax_ev_ang",
-    "geom_converged",
-    "nextra_bands_used",
-    "kill_reason",
-    "warnings",
-    # ── Elastic metadata ──────────────────────────────────────────────────────
-    "elastic_source",
-    "elastic_n_points",
-    "elastic_R2_min",
-    "elastic_quality_note",
-    "elastic_wall_time_s",
-    # ── Run metadata ──────────────────────────────────────────────────────────
-    "peak_mem_mb",
-    "step_dir",
-    "rc",
-]
+    def _run_process(self, cmd: str, cwd: Path, output_file: Path) -> "ExecResult":
+        """Shared subprocess runner with Watchdog and SIGINT skip.
 
+        Defined once in Task base — GeomOptTask and ElasticTask both inherit it.
+        Prevents the DRY violation of having two identical copies.
+        """
+        stop = threading.Event()
+        proc: subprocess.Popen | None = None
+        stderr_tail: list[str] = []
+        rc: int | None = -1
+        watchdog: "_Watchdog | None" = None
 
-def write_csv(state: RunState) -> Path:
-    dh_data = mixing_enthalpy(state.steps)
-    if dh_data:
-        dh_map = {x: dh for x, _, dh in dh_data}
-        for s in state.steps:
-            if s.status == DONE and s.concentration in dh_map:
-                s.parsed.setdefault(
-                    "dH_mix_meV_per_fu", f"{dh_map[s.concentration]:.3f}"
-                )
-
-    all_keys: set[str] = set()
-    for s in state.steps:
-        all_keys.update(s.parsed.keys())
-
-    ordered: list[str] = []
-    seen: set[str] = set(_CSV_FIXED)
-    for k in _CSV_ORDER:
-        if k not in seen and (k in all_keys or k in _CSV_FIXED):
-            ordered.append(k)
-            seen.add(k)
-    for s in state.steps:
-        for k in s.parsed:
-            if k not in seen:
-                ordered.append(k)
-                seen.add(k)
-
-    all_fields = _CSV_FIXED + ordered
-    out = state.proj_dir / config.CSV_FILE
-
-    with out.open("w", newline="", encoding="utf-8") as f:
-        f.write(f"# VCAForge v{config.VERSION} — Elastic Constants & Structural Data\n")
-        f.write(f"# System  : {state.system_label()}\n")
-        f.write(f"# Seed    : {state.seed}\n")
-        f.write(f"# Updated : {_now()}\n#\n")
-        w = csv.DictWriter(
-            f, fieldnames=all_fields, extrasaction="ignore", restval="N/A"
-        )
-        w.writeheader()
-        w.writerows(s.to_dict() for s in state.steps)
-    return out
-
-
-def mixing_enthalpy(steps: list[Step]) -> list[tuple[float, float, float]]:
-    """Return ``[(x, H_eV, dH_meV/cell)]`` sorted by x."""
-
-    def _h(s: Step) -> float | None:
+        _arm_skip()
         try:
-            return float(s.parsed["enthalpy_eV"])
-        except (KeyError, TypeError, ValueError):
-            return None
+            proc = subprocess.Popen(
+                cmd, shell=True, cwd=cwd,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            monitor = threading.Thread(
+                target=self.engine.progress_monitor,
+                args=(proc, stop, cwd),
+                daemon=True,
+            )
+            monitor.start()
 
-    done = [s for s in steps if s.status == DONE and _h(s) is not None]
-    try:
-        h0 = next(_h(s) for s in done if abs(s.concentration) < 1e-4)
-        h1 = next(_h(s) for s in done if abs(s.concentration - 1) < 1e-4)
-    except StopIteration:
-        return []
+            watchdog = _Watchdog(output_file, proc, stop, self.engine)
+            wd_thread = threading.Thread(target=watchdog.run, daemon=True)
+            wd_thread.start()
 
-    result = []
-    for s in done:
-        h = _h(s)
-        if h is None:
-            continue
-        dh = (h - ((1 - s.concentration) * h0 + s.concentration * h1)) * 1000
-        result.append((s.concentration, h, dh))
-    return sorted(result, key=lambda t: t[0])
+            def _drain_stderr() -> None:
+                if proc is not None and proc.stderr:
+                    for raw in proc.stderr:
+                        line = raw.decode(errors="replace").rstrip()
+                        if line:
+                            stderr_tail.append(line)
+                            if len(stderr_tail) > 40:
+                                stderr_tail.pop(0)
+
+            drain = threading.Thread(target=_drain_stderr, daemon=True)
+            drain.start()
+
+            while proc.poll() is None:
+                if _SKIP_FLAG:
+                    stop.set()
+                    monitor.join(2)
+                    proc.terminate()
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    _disarm_skip()
+                    return ExecResult(
+                        rc=None, skipped=True, stderr_tail=[],
+                        kill_reason=KillReason.CTRL_C,
+                    )
+                time.sleep(0.2)
+
+            drain.join(2)
+            rc = proc.returncode
+        except OSError as e:
+            stderr_tail.append(str(e))
+        finally:
+            stop.set()
+            _disarm_skip()
+            if proc and proc.poll() is None:
+                proc.kill()
+
+        kill_reason = watchdog.reason if watchdog else ""
+        return ExecResult(
+            rc=rc, skipped=False, stderr_tail=stderr_tail,
+            kill_reason=kill_reason,
+        )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Subprocess helpers
-# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class ExecResult:
+    rc: int | None
+    skipped: bool
+    stderr_tail: list[str]
+    kill_reason: str = ""
+
+
+class GeomOptTask(Task):
+    """A geometry optimization task."""
+
+    def __init__(
+        self,
+        state: "RunState",
+        step: "Step",
+        engine: "BaseEngine",
+        crystal: "Crystal",
+        keep_all: bool = False,
+    ):
+        super().__init__(state, step, engine, crystal)
+        self.keep_all = keep_all
+
+    def execute(self) -> bool:
+        x = self.step.concentration
+        seed = self.state.seed
+
+        if self.state.crystal_mode not in self.engine.SUPPORTED_MODES:
+            print(
+                f"ERROR: {self.engine.name} does not support '{self.state.crystal_mode}' mode. "
+                f"Supported: {sorted(self.engine.SUPPORTED_MODES)}"
+            )
+            return False
+
+        base_dir = self.state.proj_dir / self.engine.subdir_name
+        base_dir.mkdir(parents=True, exist_ok=True)
+        step_dir = base_dir / f"x{x:.4f}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+        self.step.step_dir = f"{self.engine.subdir_name}/x{x:.4f}"
+
+        target_mix = self._build_target_mix(self.state.species, x)
+        strategy = get_strategy(self.state.crystal_mode)
+        prepared = strategy.prepare(
+            self.crystal, self.state.template_element, target_mix, x, step_dir,
+        )
+        self.step.parsed.update(prepared.metadata)
+
+        self.engine.write_input(
+            step_dir, seed, prepared.crystal,
+        )
+
+        self.step.status = RUNNING
+        self.step.started_at = StateIO._now()
+        StateIO.save_run(self.state)
+
+        if isinstance(self.engine, InProcessCapable):
+            result = self._execute_in_process(
+                prepared, x, seed
+            )
+        elif not self.state.engine_cmd:
+            self.step.status = DONE
+            self.step.rc = "N/A"
+            self.step.finished_at = StateIO._now()
+            StateIO.save_run(self.state)
+            return True
+        else:
+            result = self._execute_subprocess(seed, step_dir)
+
+        StateIO.save_run(self.state)
+        return result.rc == 0
+
+    def _execute_subprocess(
+        self, seed: str, step_dir: Path,
+    ) -> ExecResult:
+        output_file = (
+            step_dir / f"{seed}{self.engine.output_suffix}"
+            if self.engine.output_suffix.startswith(".")
+            else step_dir / self.engine.output_suffix
+        )
+        cmd = os.path.expanduser(self.state.engine_cmd.replace("{seed}", seed))
+
+        result = self._run_process(cmd, step_dir, output_file)
+        self.step.finished_at = StateIO._now()
+
+        if result.skipped:
+            self.step.status = SKIPPED
+            self.step.rc = KillReason.CTRL_C
+        else:
+            self.step.rc = str(result.rc) if result.rc is not None else "unknown"
+            self._ingest_engine_result(
+                output_file, step_dir, seed, result,
+            )
+            self.step.status = DONE if result.rc == 0 else FAILED
+            if result.rc == 0 and not self.keep_all:
+                self.engine.cleanup(step_dir)
+
+        return result
+
+    def _execute_in_process(
+        self, prepared, x: float, seed: str,
+    ) -> ExecResult:
+        """Run an InProcessCapable engine (e.g. MLIP) in a worker thread.
+
+        Uses concurrent.futures.ThreadPoolExecutor so:
+          • The main thread stays free to catch KeyboardInterrupt (Ctrl-C).
+          • STEP_TIMEOUT_S applies uniformly — same constant as subprocess path.
+          • stop_event is passed to the engine for cooperative cancellation
+            (checked every ionic step via _StopCallback).
+        """
+        import concurrent.futures  # noqa: PLC0415
+
+        step_dir  = self.state.proj_dir / self.step.step_dir
+        stop_event = threading.Event()
+
+        # Start progress monitor in background (reads .mlip_progress.json)
+        stop_monitor = threading.Event()
+        monitor_t = threading.Thread(
+            target=self.engine.progress_monitor,
+            args=(None, stop_monitor, step_dir),
+            daemon=True,
+        )
+        monitor_t.start()
+
+        _arm_skip()
+        exec_result: ExecResult = ExecResult(rc=1, skipped=False, stderr_tail=[])
+        result = None
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(
+                    self.engine.run_in_process,
+                    step_dir, seed, prepared.crystal, stop_event,
+                )
+                deadline = time.monotonic() + config.STEP_TIMEOUT_S
+                while not future.done():
+                    if _SKIP_FLAG:
+                        stop_event.set()
+                        future.cancel()
+                        _disarm_skip()
+                        self.step.status = SKIPPED
+                        self.step.rc     = KillReason.CTRL_C
+                        self.step.finished_at = StateIO._now()
+                        return ExecResult(
+                            rc=None, skipped=True, stderr_tail=[],
+                            kill_reason=KillReason.CTRL_C,
+                        )
+                    if time.monotonic() > deadline:
+                        stop_event.set()
+                        future.cancel()
+                        _disarm_skip()
+                        self.step.status = FAILED
+                        self.step.rc     = KillReason.TIMEOUT
+                        self.step.finished_at = StateIO._now()
+                        return ExecResult(
+                            rc=None, skipped=False, stderr_tail=[],
+                            kill_reason=KillReason.TIMEOUT,
+                        )
+                    time.sleep(0.5)
+
+                result = future.result()   # re-raises engine exceptions
+
+        except KeyboardInterrupt:
+            stop_event.set()
+            _disarm_skip()
+            self.step.status = SKIPPED
+            self.step.rc     = KillReason.CTRL_C
+            self.step.finished_at = StateIO._now()
+            return ExecResult(rc=None, skipped=True, stderr_tail=[],
+                              kill_reason=KillReason.CTRL_C)
+        except Exception as exc:
+            stop_event.set()
+            _disarm_skip()
+            self.step.status = FAILED
+            self.step.rc     = f"in_process_error: {type(exc).__name__}"
+            self.step.finished_at = StateIO._now()
+            self.step.parsed["warnings"] = str(exc)
+            return ExecResult(rc=1, skipped=False, stderr_tail=[str(exc)])
+        finally:
+            stop_event.set()
+            stop_monitor.set()
+            _disarm_skip()
+
+        self.step.finished_at = StateIO._now()
+        self._merge_engine_result(result, self.step)
+        self.step.status = DONE if result.warning is None else FAILED
+        rc = 0 if result.warning is None else 1
+        self.step.rc = str(rc)
+        exec_result = ExecResult(rc=rc, skipped=False, stderr_tail=[])
+
+        if rc == 0 and not self.keep_all:
+            self.engine.cleanup(step_dir)
+        return exec_result
+
+    def _ingest_engine_result(
+        self, output_file: Path, step_dir: Path, seed: str,
+        exec_result: ExecResult,
+    ) -> None:
+        parsed = self.engine.parse_output(output_file)
+        self._merge_engine_result(parsed, self.step)
+
+        extra_out = self.engine.parse_extra_outputs(step_dir, seed)
+        if extra_out:
+            self.step.parsed.update(extra_out)
+
+        if exec_result.kill_reason:
+            self.step.parsed["kill_reason"] = exec_result.kill_reason
+
+    def _merge_engine_result(self, parsed, step: "Step") -> None:
+        result_dict = asdict(parsed)
+        extra = result_dict.pop("extra_data", {})
+        clean = {k: v for k, v in result_dict.items() if v is not None}
+        clean.update(extra)
+        if "run_time_s" in clean and "wall_time_s" not in clean:
+            clean["wall_time_s"] = clean["run_time_s"]
+        step.parsed.update(clean)
+
+class ElasticTask(Task):
+    """An elastic constants calculation task."""
+
+    def execute(self) -> bool:
+        step_dir = self.state.proj_dir / self.step.step_dir
+        seed = self.state.seed
+        x = self.step.concentration
+        density = float(self.step.parsed.get("density_gcm3") or 0) or None
+        volume = float(self.step.parsed.get("volume_ang3") or 0) or None
+
+        # Build the prepared crystal (correct species/SQS) even if loading relaxed fails
+        target_mix = self._build_target_mix(self.state.species, x)
+        strategy = get_strategy(self.state.crystal_mode)
+        # We don't need to write files here, strategy.prepare might be called with dummy dir
+        prepared = strategy.prepare(
+            self.crystal, self.state.template_element, target_mix, x, step_dir,
+        )
+
+        if isinstance(self.engine, ElasticCapable):
+            result = self.engine.run_elastic(
+                step_dir, seed, x, self.state.species,
+                self.state.nonmetal or None, density, volume,
+            )
+        elif isinstance(self.engine, InProcessElasticCapable):
+            # Load the relaxed geometry saved by MlipEngine.run_in_process.
+            # _load_mlip_relaxed_crystal returns None if the files are absent,
+            # in which case we fall back to prepared.crystal (unrelaxed but correct species).
+            opt_crystal = _load_mlip_relaxed_crystal(step_dir)
+            if opt_crystal is None:
+                import logging
+                logging.warning(
+                    "ElasticTask: relaxed_cell.npy not found in %s — "
+                    "falling back to unrelaxed (prepared) crystal. "
+                    "Elastic constants may be unreliable.",
+                    step_dir,
+                )
+                opt_crystal = prepared.crystal
+            
+            import concurrent.futures  # noqa: PLC0415
+            stop_event = threading.Event()
+            _arm_skip()
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(
+                        self.engine.run_elastic_in_process,
+                        opt_crystal, density, volume, stop_event,
+                    )
+                    deadline = time.monotonic() + config.STEP_TIMEOUT_S
+                    while not future.done():
+                        if _SKIP_FLAG:
+                            stop_event.set(); future.cancel()
+                            result = {"_elastic_error": "Interrupted (Ctrl-C)"}
+                            break
+                        if time.monotonic() > deadline:
+                            stop_event.set(); future.cancel()
+                            result = {"_elastic_error": "Elastic timed out"}
+                            break
+                        time.sleep(0.5)
+                    else:
+                        result = future.result()
+            except Exception as exc:
+                result = {"_elastic_error": f"in_process_elastic: {exc}"}
+            finally:
+                stop_event.set()
+                _disarm_skip()
+        else:
+            result = self._finite_strain_elastic(
+                step_dir, seed, x, density, volume,
+            )
+
+        self.step.parsed.update(result)
+        StateIO.save_run(self.state)
+        # Born instability is a physical result, not a task execution failure.
+        # Only fatal when _elastic_error is present AND no Cij were recorded.
+        has_cij = "C11" in result and "C12" in result and "C44" in result
+        fatal = "_elastic_error" in result and not has_cij
+        return not fatal
+
+    def _finite_strain_elastic(
+        self, step_dir: Path, seed: str, x: float,
+        density_gcm3: float | None, volume_ang3: float | None,
+    ) -> dict[str, str]:
+        if not isinstance(self.engine, FiniteStrainCapable):
+            return {
+                "_elastic_error": (
+                    f"{self.engine.name} supports neither ElasticCapable nor "
+                    f"FiniteStrainCapable — cannot compute elastic constants."
+                )
+            }
+
+        t0 = time.monotonic()
+        try:
+            opt_crystal = self.engine.load_optimised_crystal(step_dir, seed)
+        except (FileNotFoundError, ValueError) as exc:
+            return {"_elastic_error": f"load_optimised_crystal failed: {exc}"}
+
+        strain_steps = generate_strain_steps(
+            opt_crystal,
+            max_strain=config.ELASTIC_MAX_STRAIN,
+            n_steps=config.ELASTIC_N_STEPS,
+        )
+
+        stresses: list[np.ndarray] = []
+        strains: list[np.ndarray] = []
+        step_errors: list[str] = []
+
+        for ss in strain_steps:
+            sub_seed = f"{seed}{ss.name}"
+            try:
+                self.engine.write_singlepoint_input(
+                    step_dir, opt_crystal, sub_seed, ss.strain_voigt,
+                )
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                step_errors.append(f"{ss.name}: write failed: {exc}")
+                continue
+
+            output_file = (
+                step_dir / f"{sub_seed}{self.engine.output_suffix}"
+                if self.engine.output_suffix.startswith(".")
+                else step_dir / self.engine.output_suffix
+            )
+            cmd = os.path.expanduser(self.state.engine_cmd.replace("{seed}", sub_seed))
+            exec_result = self._run_process(cmd, step_dir, output_file)
+
+            if exec_result.skipped:
+                return {"_elastic_error": "Interrupted (Ctrl-C)"}
+            if exec_result.rc not in (0, None):
+                step_errors.append(
+                    f"{ss.name}: rc={exec_result.rc} reason={exec_result.kill_reason}"
+                )
+                continue
+
+            try:
+                sv = self.engine.parse_stress_tensor(output_file)
+            except (FileNotFoundError, ValueError) as exc:
+                step_errors.append(f"{ss.name}: parse failed: {exc}")
+                continue
+
+            stresses.append(sv)
+            strains.append(ss.strain_voigt)
+
+        if len(stresses) < 3:
+            detail = "; ".join(step_errors) if step_errors else "no step errors"
+            return {
+                "_elastic_error": (
+                    f"Not enough stress tensors ({len(stresses)}/"
+                    f"{len(strain_steps)}). Step errors: {detail}"
+                )
+            }
+
+        result = fit_cij_universal(
+            stresses, strains,
+            density_gcm3=density_gcm3,
+            n_atoms=opt_crystal.num_atoms,
+            volume_ang3=volume_ang3,
+        )
+        result["elastic_wall_time_s"] = f"{time.monotonic() - t0:.0f}"
+        result["elastic_source"] = (
+            f"{self.engine.name.upper()}-FiniteStrain-{opt_crystal.lattice_type}"
+        )
+        self.engine.cleanup(step_dir)
+        return result
+
+class TaskRunner:
+    def __init__(self, queue: list[Task]):
+        self.queue = queue
+
+    def run(self):
+        for task in self.queue:
+            success = task.execute()
+            if not success:
+                print(f"Task {type(task).__name__} failed. Halting queue.")
+                break
+
+
+class ParallelTaskRunner:
+    """Runs GeomOptTasks concurrently; ElasticTasks sequentially after their step.
+
+    Designed for MLIP GPU workflows where N concentration points can be
+    computed independently in parallel on the same GPU (or across GPUs).
+    DFT engines (CASTEP, VASP) should use max_workers=1 to avoid I/O conflicts.
+
+    Task dependency rule: ElasticTask for step S must run AFTER GeomOptTask
+    for the same step S (ElasticTask reads volume/density from step.parsed).
+    All other GeomOptTasks are independent and can run concurrently.
+    """
+
+    def __init__(self, queue: list[Task], max_workers: int = 4):
+        self.queue = queue
+        self.max_workers = max(1, max_workers)
+
+    def run(self) -> None:
+        import concurrent.futures  # noqa: PLC0415
+
+        # Split into per-step pairs: {step_id: (GeomOptTask, ElasticTask|None)}
+        geom_tasks:    list[GeomOptTask] = []
+        elastic_map:   dict[int, ElasticTask] = {}
+
+        for task in self.queue:
+            if isinstance(task, GeomOptTask):
+                geom_tasks.append(task)
+            elif isinstance(task, ElasticTask):
+                elastic_map[id(task.step)] = task
+            else:
+                # Unknown task type — run sequentially for safety
+                task.execute()
+
+        def _run_step(geom: GeomOptTask) -> bool:
+            success = geom.execute()
+            if success:
+                elastic = elastic_map.get(id(geom.step))
+                if elastic:
+                    success = elastic.execute()
+            else:
+                print(
+                    f"  [parallel] GeomOptTask x={geom.step.concentration:.4f} "
+                    f"failed — skipping elastic for this step."
+                )
+            return success
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers
+        ) as executor:
+            futures = {
+                executor.submit(_run_step, g): g for g in geom_tasks
+            }
+            for future in concurrent.futures.as_completed(futures):
+                task = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(
+                        f"  [parallel] Step x={task.step.concentration:.4f} "
+                        f"raised: {type(exc).__name__}: {exc}"
+                    )
+
+
+class _Watchdog:
+    """Kills the engine on timeout or engine-reported health failure."""
+
+    _POLL_S = 10.0
+
+    def __init__(
+        self, output_file: Path, proc: subprocess.Popen,
+        stop: threading.Event, engine: "BaseEngine",
+    ) -> None:
+        self._file = output_file
+        self._proc = proc
+        self._stop = stop
+        self._engine = engine
+        self.reason = ""
+
+    def run(self) -> None:
+        t_start = time.monotonic()
+        while not self._stop.is_set():
+            elapsed = time.monotonic() - t_start
+            if elapsed > config.STEP_TIMEOUT_S:
+                self.reason = KillReason.TIMEOUT
+                self._kill(
+                    f"step timed out after {int(elapsed / 60)}m "
+                    f"(limit {int(config.STEP_TIMEOUT_S / 60)}m)"
+                )
+                return
+            if self._file.exists() and isinstance(self._engine, WatchdogCapable):
+                try:
+                    text = read_tail(self._file, max_bytes=2 * 1024 * 1024)
+                except OSError:
+                    self._stop.wait(self._POLL_S)
+                    continue
+                kill_reason = self._engine.check_health(text)
+                if kill_reason:
+                    self.reason = kill_reason
+                    self._kill(f"engine health check failed: {kill_reason}")
+                    return
+            self._stop.wait(self._POLL_S)
+
+    def _kill(self, msg: str) -> None:
+        print(f"  │  ⚠  Watchdog: {msg}", flush=True)
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        except OSError:
+            pass
+
 
 _SKIP_FLAG: bool = False
 
@@ -519,373 +684,3 @@ def _arm_skip() -> None:
 
 def _disarm_skip() -> None:
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-
-
-class _Watchdog:
-    """
-    Kills the engine automatically when it stalls or exceeds the time limit.
-    Delegates health-checking completely to the engine via WatchdogCapable protocol.
-    """
-
-    _POLL_S = 10.0
-
-    def __init__(
-        self,
-        output_file: Path,
-        proc: subprocess.Popen,
-        stop: threading.Event,
-        engine: BaseEngine,
-    ) -> None:
-        self._file = output_file
-        self._proc = proc
-        self._stop = stop
-        self._engine = engine
-        self.reason = ""
-
-    def run(self) -> None:
-        t_start = time.monotonic()
-        while not self._stop.is_set():
-            elapsed = time.monotonic() - t_start
-
-            if elapsed > config.STEP_TIMEOUT_S:
-                self.reason = _KR_TIMEOUT
-                self._kill(
-                    f"step timed out after {int(elapsed / 60)}m "
-                    f"(limit {int(config.STEP_TIMEOUT_S / 60)}m)"
-                )
-                return
-
-            if self._file.exists() and isinstance(self._engine, WatchdogCapable):
-                try:
-                    text = read_tail(self._file, max_bytes=2 * 1024 * 1024)
-                except OSError:
-                    self._stop.wait(self._POLL_S)
-                    continue
-
-                kill_reason = self._engine.check_health(text)
-                if kill_reason:
-                    self.reason = kill_reason
-                    self._kill(f"engine health check failed: {kill_reason}")
-                    return
-
-            self._stop.wait(self._POLL_S)
-
-    def _kill(self, msg: str) -> None:
-        print(f"\n  │  ⚠  Watchdog: {msg}", flush=True)
-        try:
-            self._proc.terminate()
-            try:
-                self._proc.wait(10)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        except OSError:
-            pass
-
-
-@dataclass
-class ExecResult:
-    rc: int | None
-    skipped: bool
-    stderr_tail: list[str]
-    kill_reason: str = ""
-
-
-def run_process(
-    cmd: str, cwd: Path, output_file: Path, *, engine: BaseEngine
-) -> ExecResult:
-    """Run cmd in cwd with real-time stdout progress monitoring and watchdog."""
-    stop = threading.Event()
-    proc: subprocess.Popen | None = None
-    stderr_tail: list[str] = []
-    rc = -1
-    watchdog: _Watchdog | None = None
-
-    _arm_skip()
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        proc._cwd = cwd  # Some engines' progress_monitor rely on this attribute
-
-        monitor = threading.Thread(
-            target=engine.progress_monitor, args=(proc, stop), daemon=True
-        )
-        monitor.start()
-
-        watchdog = _Watchdog(output_file, proc, stop, engine)
-        wd_thread = threading.Thread(target=watchdog.run, daemon=True)
-        wd_thread.start()
-
-        def _drain_stderr() -> None:
-            if proc is not None and proc.stderr:
-                for raw in proc.stderr:
-                    line = raw.decode(errors="replace").rstrip()
-                    if line:
-                        stderr_tail.append(line)
-                        if len(stderr_tail) > 40:
-                            stderr_tail.pop(0)
-
-        drain = threading.Thread(target=_drain_stderr, daemon=True)
-        drain.start()
-
-        while proc.poll() is None:
-            if _SKIP_FLAG:
-                stop.set()
-                monitor.join(2)
-                proc.terminate()
-                try:
-                    proc.wait(10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                _disarm_skip()
-                return ExecResult(
-                    rc=None, skipped=True, stderr_tail=[], kill_reason=_KR_CTRL_C
-                )
-            time.sleep(0.2)
-
-        drain.join(2)
-        rc = proc.returncode
-    except OSError as e:
-        stderr_tail.append(str(e))
-    finally:
-        stop.set()
-        if "monitor" in locals():
-            monitor.join(2)
-        _disarm_skip()
-        if proc and proc.poll() is None:
-            proc.kill()
-
-    kill_reason = watchdog.reason if watchdog else ""
-    return ExecResult(
-        rc=rc, skipped=False, stderr_tail=stderr_tail, kill_reason=kill_reason
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Step execution  (engine-agnostic)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def execute_step(
-    state: RunState,
-    step: Step,
-    crystal: Crystal,
-    engine: BaseEngine,
-    keep_all: bool = False,
-) -> ExecResult:
-    """Prepare inputs, run the engine, parse outputs, persist state."""
-    x = step.concentration
-    seed = state.seed
-
-    base_dir = state.proj_dir / engine.subdir_name
-    base_dir.mkdir(parents=True, exist_ok=True)
-    step_dir = base_dir / f"x{x:.4f}"
-    step_dir.mkdir(parents=True, exist_ok=True)
-    step.step_dir = f"{engine.subdir_name}/x{x:.4f}"
-
-    if state.crystal_mode not in engine.SUPPORTED_MODES:
-        raise IncompatibleMode(
-            f"{engine.name} does not support '{state.crystal_mode}' mode. "
-            f"Supported: {engine.SUPPORTED_MODES}"
-        )
-
-    engine.write_input(
-        step_dir, seed, crystal, state.species, x, state.template_element
-    )
-
-    step.status = RUNNING
-    step.started_at = _now()
-    save_run(state)
-    write_csv(state)
-
-    if not state.engine_cmd:
-        step.status = DONE
-        step.rc = "N/A"
-        step.finished_at = _now()
-        save_run(state)
-        write_csv(state)
-        return ExecResult(rc=0, skipped=False, stderr_tail=[])
-
-    output_file = (
-        step_dir / f"{seed}{engine.output_suffix}"
-        if engine.output_suffix.startswith(".")
-        else step_dir / engine.output_suffix
-    )
-    cmd = os.path.expanduser(state.engine_cmd.replace("{seed}", seed))
-
-    result = run_process(cmd, step_dir, output_file, engine=engine)
-    step.finished_at = _now()
-
-    if result.skipped:
-        step.status = SKIPPED
-        step.rc = "ctrl-c"
-    else:
-        step.rc = str(result.rc) if result.rc is not None else "unknown"
-
-        parsed = engine.parse_output(output_file)
-        result_dict = asdict(parsed)
-        extra = result_dict.pop("extra_data", {})
-
-        clean_dict = {k: v for k, v in result_dict.items() if v is not None}
-        clean_dict.update(extra)
-
-        if "run_time_s" in clean_dict and "wall_time_s" not in clean_dict:
-            clean_dict["wall_time_s"] = clean_dict["run_time_s"]
-
-        step.parsed.update(clean_dict)
-
-        extra_out = engine.parse_extra_outputs(step_dir, seed)
-        if extra_out:
-            step.parsed.update(extra_out)
-
-        if result.kill_reason:
-            step.parsed["kill_reason"] = result.kill_reason
-
-        step.status = DONE if result.rc == 0 else FAILED
-
-        if result.rc == 0 and not keep_all:
-            engine.cleanup(step_dir)
-
-    save_run(state)
-    write_csv(state)
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Elastic workflow — capability-based routing via isinstance()
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def run_elastic_for_step(
-    state: RunState,
-    step: Step,
-    engine: BaseEngine,
-) -> dict[str, str]:
-    """Route elastic calculation based on engine capabilities."""
-    step_dir = state.proj_dir / step.step_dir
-    seed = state.seed
-    x = step.concentration
-    density = float(step.parsed.get("density_gcm3") or 0) or None
-    volume = float(step.parsed.get("volume_ang3") or 0) or None
-
-    if isinstance(engine, ElasticCapable):
-        result = engine.run_elastic(
-            step_dir,
-            seed,
-            x,
-            state.species,
-            state.nonmetal or None,
-            density,
-            volume,
-        )
-        if "_elastic_error" in result and "Born" in result.get("_elastic_error", ""):
-            result.setdefault("born_stable", "False")
-        return result
-
-    return _finite_strain_elastic(
-        state, step, engine, step_dir, seed, x, density, volume
-    )
-
-
-def _finite_strain_elastic(
-    state: RunState,
-    step: Step,
-    engine: BaseEngine,
-    step_dir: Path,
-    seed: str,
-    x: float,
-    density_gcm3: float | None,
-    volume_ang3: float | None,
-) -> dict[str, str]:
-    import numpy as np
-    from core_physics import fit_cij_cubic, generate_strain_steps
-
-    if not isinstance(engine, FiniteStrainCapable):
-        return {
-            "_elastic_error": (
-                f"{engine.name} supports neither ElasticCapable nor FiniteStrainCapable — "
-                "cannot compute elastic constants."
-            )
-        }
-
-    t0 = time.monotonic()
-
-    try:
-        opt_crystal = engine.load_optimised_crystal(step_dir, seed)
-    except (FileNotFoundError, ValueError) as exc:
-        return {"_elastic_error": f"load_optimised_crystal failed: {exc}"}
-
-    strain_steps = generate_strain_steps(
-        opt_crystal,
-        max_strain=config.ELASTIC_MAX_STRAIN,
-        n_steps=config.ELASTIC_N_STEPS,
-    )
-
-    stresses: list[np.ndarray] = []
-    strains: list[np.ndarray] = []
-    step_errors: list[str] = []
-
-    for ss in strain_steps:
-        sub_seed = f"{seed}{ss.name}"
-
-        try:
-            engine.write_singlepoint_input(
-                step_dir, opt_crystal, sub_seed, state.species, x, ss.strain_voigt
-            )
-        except (FileNotFoundError, ValueError, OSError) as exc:
-            step_errors.append(f"{ss.name}: write failed: {exc}")
-            continue
-
-        output_file = (
-            step_dir / f"{sub_seed}{engine.output_suffix}"
-            if engine.output_suffix.startswith(".")
-            else step_dir / engine.output_suffix
-        )
-        cmd = os.path.expanduser(state.engine_cmd.replace("{seed}", sub_seed))
-        run_process(cmd, step_dir, output_file, engine=engine)
-
-        try:
-            sv = engine.parse_stress_tensor(output_file)
-        except (FileNotFoundError, ValueError) as exc:
-            step_errors.append(f"{ss.name}: parse failed: {exc}")
-            continue
-
-        stresses.append(sv)
-        strains.append(ss.strain_voigt)
-
-    if len(stresses) < 3:
-        error_detail = (
-            "; ".join(step_errors) if step_errors else "no step errors recorded"
-        )
-        return {
-            "_elastic_error": (
-                f"Not enough stress tensors ({len(stresses)}/{len(strain_steps)}). "
-                f"Step errors: {error_detail}"
-            )
-        }
-
-    result = fit_cij_cubic(
-        stresses,
-        strains,
-        density_gcm3=density_gcm3,
-        n_atoms=opt_crystal.num_atoms,
-        volume_ang3=volume_ang3,
-    )
-    result["elastic_wall_time_s"] = f"{time.monotonic() - t0:.0f}"
-    result["elastic_source"] = (
-        f"{engine.name.upper()}-FiniteStrain-{opt_crystal.lattice_type}"
-    )
-    return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
