@@ -321,9 +321,21 @@ class MlipEngine(
             if "_elastic_error" in result:
                     return result
 
+            # Calibrated Vickers hardness for MLIP (corrects systematic softening)
+            try:
+                B = float(result.get("B_Hill_GPa", 0.0))
+                G = float(result.get("G_Hill_GPa", 0.0))
+                if B > 0 and G > 0:
+                    # Formula: results['VCAForge_Calibrated'] = max(-53.18 + 0.2149 * B + 0.1976 * G, 0.0)
+                    val = -53.18 + 0.2149 * B + 0.1976 * G
+                    result["H_Vickers_VCAForge_Calibrated"] = f"{max(val, 0.0):.4f}"
+            except (ValueError, TypeError):
+                pass
+
             if b_eos_gpa > 0:
                 result["B_EOS_GPa"] = f"{b_eos_gpa:.4f}"
             
+            result["elastic_source"] = f"MLIP-{self.model_name.upper()}"
             result["elastic_wall_time_s"] = f"{time.monotonic() - t0:.1f}"
             return result
         finally:

@@ -286,12 +286,12 @@ def wizard_mode(crystal: Crystal, args: Any) -> WizardResult:
         )
 
     nonzero = {e: f for e, f in target_mix_at_x1.items() if f > 1e-9}
-    if len(nonzero) == 1:
-        sole = next(iter(nonzero))
+    if len(target_mix_at_x1) == 1:
+        sole = next(iter(nonzero)) if nonzero else next(iter(target_mix_at_x1))
         print(f"· Mode: single compound ({sole}{nonmetal})")
         return WizardResult(
             template_element=template,
-            target_mix={sole: 1.0},
+            target_mix=target_mix_at_x1,
             single_mode=True,
             c_start=0.0, c_end=0.0, n_steps=0,
             nonmetal=nonmetal,
@@ -302,8 +302,9 @@ def wizard_mode(crystal: Crystal, args: Any) -> WizardResult:
         f"· Mode: sweep  {template}(1-x) → mixture(x)  "
         f"on {template} sublattice"
     )
+    # Ensure mixture output displays properly even if some are 0.0
     print("    Mixture at x=1: "
-          + "  ".join(f"{e}={f:.4f}" for e, f in nonzero.items()))
+          + "  ".join(f"{e}={f:.4f}" for e, f in target_mix_at_x1.items()))
 
     points = _resolve_concentration_points(args)
     run_elastic = _resolve_run_elastic(args, default=False)

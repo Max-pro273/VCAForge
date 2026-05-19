@@ -46,6 +46,23 @@ def _csv_filename() -> str:
     return _cfg("CSV_FILE", "vca_results.csv")
 
 
+def aggregate_dirs(
+    dirs: list[str | Path], 
+    output: str | None = None,
+    target: str | None = None,
+    mode: str = "maximize",
+    crystal_mode: str | None = None,
+) -> None:
+    """Entry point for the CLI to aggregate multiple directories."""
+    agg = ResultAggregator(target=target, mode=mode, crystal_mode=crystal_mode)
+    for d in dirs:
+        d_path = Path(d)
+        log.info(f"Aggregating directory: {d_path}")
+        try:
+            agg.aggregate_all_systems(d_path)
+        except Exception as exc:
+            log.error(f"Failed to aggregate {d_path}: {exc}")
+
 @dataclass
 class AggregationStats:
     """Summary of an aggregation pass."""
@@ -83,10 +100,12 @@ class ResultAggregator:
         mode: str = "maximize",
         dedupe_tol: float = 1e-3,
         dedupe_policy: str = "best",   # "best" | "mean" | "all"
+        crystal_mode: str | None = None,
     ) -> None:
         self.target = target or _cfg("NAVIGATOR_TARGET", "H_Vickers_GPa")
         self.mode = mode.lower()
         self.dedupe_tol = float(dedupe_tol)
+        self.crystal_mode = crystal_mode.lower() if crystal_mode else None
         if dedupe_policy not in self._DEDUP_POLICIES:
             raise ValueError(
                 f"dedupe_policy must be one of {sorted(self._DEDUP_POLICIES)}, "
@@ -165,6 +184,18 @@ class ResultAggregator:
                 continue
             if df.empty:
                 continue
+
+            # Parse calculation mode from header
+            csv_mode = self._parse_mode_from_header(f) or "vca"
+            # Logic: include if (exact mode match) OR (csv is 'direct' — shared baseline)
+            # This allows pure-phase results (direct) to feed into both SQS and VCA training sets.
+            # We assume the user wants to aggregate into the mode of the 'system' provided.
+            # For simplicity, if this aggregator was called via navigate --crystal-mode X,
+            # we want to match that X.
+            if csv_mode != "direct" and hasattr(self, "crystal_mode") and self.crystal_mode:
+                if csv_mode != self.crystal_mode:
+                    continue
+
             # Reconstruct per-metal x_M columns IN THE SUBSYSTEM's own column
             # names first, then expand to the target system's columns by
             # filling missing metals with 0.
@@ -172,6 +203,7 @@ class ResultAggregator:
             df = self._project_to_target_system(df, sys_in_csv, system)
             df = self._normalise_for_master(df, f, base_dir, system)
             df["origin_system"] = sys_in_csv.label()   # provenance for subsystems
+            df["mode"] = csv_mode
             frames.append(df)
             matched_files.append(f)
 
@@ -187,6 +219,8 @@ class ResultAggregator:
 
         # Deduplicate
         before = len(merged)
+        # Note: _deduplicate only merges status=done rows.
+        # Failed rows are preserved (concat at the end of _deduplicate).
         merged = self._deduplicate(merged, system)
         dups = before - len(merged)
 
@@ -203,6 +237,22 @@ class ResultAggregator:
             len(matched_files), len(merged), output_path, dups,
         )
         return output_path
+
+    @staticmethod
+    def _parse_mode_from_header(csv_path: Path) -> str | None:
+        import re
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                for _ in range(20):
+                    line = f.readline()
+                    if not line: break
+                    if not line.startswith("#"): break
+                    m = re.match(r"^\s*#\s*Mode\s*:\s*(.+?)\s*$", line)
+                    if m:
+                        return m.group(1).lower()
+        except Exception:
+            pass
+        return None
 
     def aggregate_all_systems(
         self, base_dir: Path, include_subsystems: bool = True,
@@ -232,6 +282,11 @@ class ResultAggregator:
         files = self._discover_csvs(base_dir, exclude=None)
         seen: dict[str, SystemSpec] = {}
         for f in files:
+            # Parse calculation mode from header
+            csv_mode = self._parse_mode_from_header(f) or "vca"
+            if csv_mode != "direct" and self.crystal_mode and csv_mode != self.crystal_mode:
+                continue
+
             try:
                 s = parse_system_from_csv(f)
             except Exception as exc:  # noqa: BLE001
@@ -335,21 +390,27 @@ class ResultAggregator:
         df = df.copy()
         c = pd.to_numeric(df["concentration"], errors="coerce")
 
+        # Unary fallback: if system only has 1 metal, its fraction is 1.0
+        if system.n_metals == 1:
+            df[cols[0]] = 1.0
+            return df
+
         # Try bracketed-VCA reconstruction
         bracket_info = parse_bracket_header_with_fractions(src)
         if bracket_info is not None:
-            # Defensive: must be 2-tuple. Older versions returned 3-tuples.
-            if not isinstance(bracket_info, tuple) or len(bracket_info) < 2:
+            # Defensive: must be 3-tuple now.
+            if not isinstance(bracket_info, tuple) or len(bracket_info) < 3:
                 log.warning(
                     "parse_bracket_header_with_fractions returned %r — version mismatch? "
                     "Skipping bracket reconstruction for %s.", bracket_info, src,
                 )
                 return df
             bracket_fracs = bracket_info[1]
+            metal_a = bracket_info[2]
             for m, col in zip(system.metals, cols):
                 frac = float(bracket_fracs.get(m, 0.0))
-                if frac >= 0.999:   # pure-metal sentinel (frac==1.0)
-                    df[col] = (1.0 - c)
+                if m == metal_a:
+                    df[col] = (1.0 - c) + c * frac
                 else:
                     df[col] = c * frac
             return df
@@ -421,7 +482,14 @@ class ResultAggregator:
 
         # Only deduplicate among status=done rows
         if "status" in df.columns:
-            done_mask = df["status"].fillna("").astype(str).str.lower() == "done"
+            status_lower = df["status"].fillna("").astype(str).str.lower()
+            done_mask = status_lower == "done"
+            # Filter out pending/skipped rows entirely
+            keep_mask = status_lower.isin(["done", "failed"])
+            df = df[keep_mask].copy()
+            # Re-compute masks on filtered df
+            status_lower = df["status"].fillna("").astype(str).str.lower()
+            done_mask = status_lower == "done"
         else:
             done_mask = pd.Series([True] * len(df), index=df.index)
 

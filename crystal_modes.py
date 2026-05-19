@@ -84,6 +84,7 @@ class CrystalModeStrategy(Protocol):
         target_mix: dict[str, float],
         x: float,
         step_dir: Path,
+        verbose: bool = True,
     ) -> PreparedCrystal: ...
 
 
@@ -104,6 +105,7 @@ class VCAStrategy:
         target_mix: dict[str, float],
         x: float,
         step_dir: Path,
+        verbose: bool = True,
     ) -> PreparedCrystal:
         # 1. Vegard scaling
         eps = 1e-9
@@ -169,6 +171,7 @@ class DirectStrategy:
         target_mix: dict[str, float],
         x: float,
         step_dir: Path,
+        verbose: bool = True,
     ) -> PreparedCrystal:
         nonzero = {e: f for e, f in target_mix.items() if f > 1e-9}
         if len(nonzero) != 1:
@@ -404,6 +407,7 @@ class SQSStrategy:
         target_mix: dict[str, float],
         x: float,
         step_dir: Path,
+        verbose: bool = True,
     ) -> PreparedCrystal:
         try:
             from sqsgenerator import StructureFormat, optimize, parse_config  # noqa: PLC0415
@@ -418,20 +422,66 @@ class SQSStrategy:
         )
 
         # ── Console summary (matches sqs.py output) ───────────────────────────
-        nx, ny, nz = plan.dims
-        print(
-            f"\n  ── SQS supercell x={x:.4f} ──────────────────────────────\n"
-            f"  Dimensions    : {nx}×{ny}×{nz}\n"
-            f"  Template sites: {plan.n_template_sites}  "
-            f"({'exact' if plan.is_exact else f'error {plan.max_deviation*100:.4f}%'})\n"
-            "  Distribution  :"
-        )
-        for el, count in plan.integer_counts.items():
-            ach = plan.achieved_fractions.get(el, 0.0) * 100
-            tgt = target_mix.get(el, 0.0) * 100
-            print(f"    {el:2s}: {count:4d}  actual {ach:6.2f}%  target {tgt:6.2f}%")
-        print("  ─────────────────────────────────────────────────────────")
+        if verbose:
+            nx, ny, nz = plan.dims
+            print(
+                f"\n  ── SQS supercell x={x:.4f} ──────────────────────────────\n"
+                f"  Dimensions    : {nx}×{ny}×{nz}\n"
+                f"  Template sites: {plan.n_template_sites}  "
+                f"({'exact' if plan.is_exact else f'error {plan.max_deviation*100:.4f}%'})\n"
+                "  Distribution  :"
+            )
+            for el, count in plan.integer_counts.items():
+                ach = plan.achieved_fractions.get(el, 0.0) * 100
+                tgt = target_mix.get(el, 0.0) * 100
+                print(f"    {el:2s}: {count:4d}  actual {ach:6.2f}%  target {tgt:6.2f}%")
+            print("  ─────────────────────────────────────────────────────────")
         # ─────────────────────────────────────────────────────────────────────
+
+        if len(plan.integer_counts) == 1:
+            from ase import Atoms
+            from ase.build import make_supercell
+            import numpy as np
+
+            # Bypass sqsgenerator optimization for 100% pure substitutions
+            el = next(iter(plan.integer_counts.keys()))
+            symbols = [max(s, key=s.get).capitalize() for s in base_crystal.sites]
+            atoms = Atoms(
+                symbols=symbols, 
+                scaled_positions=base_crystal.frac_coords, 
+                cell=base_crystal.lattice, 
+                pbc=True
+            )
+            P = np.diag(plan.dims)
+            super_atoms = make_supercell(atoms, P)
+
+            syms = np.array(super_atoms.get_chemical_symbols())
+            syms[syms == template_element.capitalize()] = el.capitalize()
+            super_atoms.set_chemical_symbols(syms)
+
+            sites = [{str(s).capitalize(): 1.0} for s in super_atoms.get_chemical_symbols()]
+            crystal = Crystal(
+                lattice=np.asarray(super_atoms.cell),
+                frac_coords=super_atoms.get_scaled_positions(),
+                sites=sites
+            )
+
+            sqs_dir = step_dir / config.SQS_SUBDIR
+            sqs_dir.mkdir(parents=True, exist_ok=True)
+            
+            return PreparedCrystal(
+                crystal=crystal,
+                metadata={
+                    "strategy":             "sqs_bypass_pure",
+                    "sqs_supercell":        "x".join(str(n) for n in plan.dims),
+                    "sqs_n_template_sites": str(plan.n_template_sites),
+                    "sqs_objective":        "0.000000",
+                    "sqs_iterations":       "0",
+                    "sqs_max_deviation":    "0.000000",
+                    "sqs_is_exact":         "yes",
+                },
+                artifacts=(),
+            )
 
         cfg_dict = self._build_sqsgen_config(
             base_crystal, template_element, plan
@@ -559,7 +609,7 @@ class SQSStrategy:
                 {
                     "sites": template_element.capitalize(),
                     **{el.capitalize(): int(n)
-                       for el, n in plan.integer_counts.items()},
+                       for el, n in plan.integer_counts.items() if n > 0},
                 }
             ],
         }

@@ -87,8 +87,8 @@ ELEMENTS: dict[str, dict[str, Any]] = {
 # ── SQS (Special Quasirandom Structures via sqsgenerator) ────────────────────
 # These defaults are used by crystal_modes.SQSStrategy. Override per-run
 # either by editing this file or by extending the wizard schema.
-SQS_MAX_EXTENT: int = 3
-SQS_ITERATIONS: int = 1_000_000       # Monte-Carlo iterations
+SQS_MAX_EXTENT: int = 2
+SQS_ITERATIONS: int = 2_000_000       # Monte-Carlo iterations
 SQS_SHELL_WEIGHTS: dict[int, float] = {1: 1.0}  # coordination shells → weight
 SQS_SUBDIR: str = "SQS"
 # Number of parallel Monte-Carlo threads passed to sqsgenerator as

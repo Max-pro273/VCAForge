@@ -86,9 +86,9 @@ class Task(ABC):
     ) -> dict[str, float]:
         """Convert state.species + x → per-species fraction on the template
         sublattice. species[0] phases out as x → 1."""
-        mix = {species[0][0]: 1.0 - x}
+        mix = {species[0][0]: 1.0 - x + species[0][1] * x}
         for e, f in species[1:]:
-            mix[e] = f * x
+            mix[e] = mix.get(e, 0.0) + f * x
         return mix
 
     def _run_process(self, cmd: str, cwd: Path, output_file: Path) -> "ExecResult":
@@ -396,6 +396,7 @@ class ElasticTask(Task):
         # We don't need to write files here, strategy.prepare might be called with dummy dir
         prepared = strategy.prepare(
             self.crystal, self.state.template_element, target_mix, x, step_dir,
+            verbose=False,
         )
 
         if isinstance(self.engine, ElasticCapable):

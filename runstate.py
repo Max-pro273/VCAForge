@@ -110,14 +110,21 @@ class RunState:
             return self.seed
         sp = self.species
         nm = self.nonmetal
-        if len(sp) == 2:
-            metal = f"{sp[0][0]}(1-x){sp[1][0]}(x)"
-        elif len(sp) > 2:
-            inner = "".join(f"{e}{f:.2f}" for e, f in sp[1:])
-            metal = f"{sp[0][0]}(1-x)[{inner}](x)"
+        base = self.template_element
+        if not base and sp:
+            base = sp[0][0]
+
+        if len(sp) == 2 and sum(f for e, f in sp if e != base) == 1.0:
+            other = next(e for e, f in sp if e != base)
+            metal = f"{base}(1-x){other}(x)"
         else:
-            # len(sp) == 1
-            metal = f"{sp[0][0]}"
+            inner_parts = []
+            # self.species might not be sorted alphabetically, sort it for consistent brackets
+            for e, f in sorted(sp, key=lambda kv: kv[0]):
+                # Keep elements even with 0.0 fraction so the system dimensionality is preserved
+                inner_parts.append(f"{e}{f:.4f}")
+            inner = "".join(inner_parts)
+            metal = f"{base}(1-x)[{inner}](x)"
         return f"{metal}{nm}" if nm else metal
 
     def to_json(self) -> dict[str, Any]:
@@ -174,7 +181,9 @@ class StateIO:
         "G_Voigt_GPa", "G_Reuss_GPa", "G_Hill_GPa",
         "E_GPa", "nu", "Zener_A", "Pugh_ratio",
         "Cauchy_pressure_GPa", "C_prime_GPa",
-        "H_Vickers_Chen_GPa", "H_Vickers_Tian_GPa", "born_stable",
+        "H_Vickers_Chen_GPa", "H_Vickers_Tian_GPa",
+        "H_Vickers_VCAForge_Calibrated",
+        "born_stable",
         "v_longitudinal_ms", "v_transverse_ms", "v_mean_ms", "T_Debye_K",
         "residual_pressure_GPa", "fmax_ev_ang",
         "geom_converged", "kill_reason", "warnings",

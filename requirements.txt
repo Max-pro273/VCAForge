@@ -1,3 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 numpy>=1.26
 spglib>=2.4
 cif2cell
+
+ase
+sqsgenerator
+torch+cpu
+mace-torch
+mace
+
+sklearn
+scipy
+pandas

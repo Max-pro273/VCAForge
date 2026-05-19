@@ -107,6 +107,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directories to aggregate (default: scan current directory).")
     agg_p.add_argument("--out", type=Path, default=None,
         help="Output CSV path (default: <cwd>/<stem>_master.csv).")
+    agg_p.add_argument("--mode", choices=["sqs", "vca", "direct"], default=None,
+        help="Calculation mode to aggregate (sqs|vca|direct). Baseline 'direct' points are always included.")
+    agg_p.add_argument("--target", default=None,
+        help="Property column used for deduplication (keeping best).")
+    agg_p.add_argument("--maximize", action="store_const", const="maximize", dest="direction",
+        help="Maximize target value during deduplication (default).")
+    agg_p.add_argument("--minimize", action="store_const", const="minimize", dest="direction",
+        help="Minimize target value during deduplication.")
 
     # ── visualize ─────────────────────────────────────────────────────────────
     viz_p = sub.add_parser(
@@ -610,7 +618,12 @@ def _cmd_aggregate(args: argparse.Namespace) -> None:
     dirs = getattr(args, "dirs", None) or [Path(".")]
     out  = getattr(args, "out", None)
     if hasattr(aggregator, "aggregate_dirs"):
-        aggregator.aggregate_dirs(dirs, output=out)
+        aggregator.aggregate_dirs(
+            dirs, output=out, 
+            crystal_mode=getattr(args, "mode", None),
+            target=getattr(args, "target", None),
+            mode=getattr(args, "direction", "maximize") or "maximize"
+        )
     else:
         sys.exit("  ERROR: aggregator.py does not expose aggregate_dirs().")
 
@@ -661,11 +674,16 @@ def _create_run(
     args: argparse.Namespace, src: Path, crystal: Crystal,
     engine: "BaseEngine", engine_name: str, mode: str, wr: Any,
 ) -> RunState:
-    species_list = (
-        [(next(iter(wr.target_mix)), 1.0)]
-        if wr.single_mode
-        else sorted(wr.target_mix.items(), key=lambda kv: kv[1])
-    )
+    if wr.single_mode:
+        species_list = [(next(iter(wr.target_mix)), 1.0)]
+    else:
+        # The template element MUST be the first element in species_list,
+        # as it is the one that phases out (1-x) in _build_target_mix.
+        template = wr.template_element
+        species_list = [(template, wr.target_mix.get(template, 0.0))]
+        for k, v in sorted(wr.target_mix.items()):
+            if k != template:
+                species_list.append((k, v))
 
     crystal_kwargs: dict[str, object] = {}
     if mode == "sqs":

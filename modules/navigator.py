@@ -128,9 +128,9 @@ class SystemSpec:
     nonmetal: str = ""
 
     def __post_init__(self) -> None:
-        if len(self.metals) < 2:
+        if len(self.metals) < 1:
             raise ValueError(
-                f"SystemSpec needs at least 2 metals, got {len(self.metals)}: {self.metals}"
+                f"SystemSpec needs at least 1 metal, got {len(self.metals)}: {self.metals}"
             )
 
     @property
@@ -140,7 +140,7 @@ class SystemSpec:
     @property
     def n_dims(self) -> int:
         """Free dimensions on the simplex (N-1 because Σx=1)."""
-        return self.n_metals - 1
+        return max(0, self.n_metals - 1)
 
     @property
     def metal_a(self) -> str:
@@ -150,6 +150,8 @@ class SystemSpec:
     @property
     def metal_b(self) -> str:
         """Backward-compat: second metal (binary's M_b)."""
+        if self.n_metals < 2:
+            return ""
         return self.metals[1]
 
     def label(self) -> str:
@@ -404,10 +406,6 @@ def _parse_bracket_pairs(content: str) -> list[tuple[str, float]] | None:
         return None
     if not pairs:
         return None
-    # Sanity: fractions should sum to ~1
-    s = sum(f for _, f in pairs)
-    if not (0.95 < s < 1.05):
-        return None
     return pairs
 
 
@@ -438,7 +436,7 @@ def parse_system_from_csv(csv_path: Path) -> SystemSpec | None:
                 if metals_match:
                     metals_str = metals_match.group(1).strip()
                     metals = tuple(s.strip() for s in metals_str.split(",") if s.strip())
-                    if len(metals) >= 2:
+                    if len(metals) >= 1:
                         nm_match = _NONMETAL_KV_RE.search(full)
                         nm = nm_match.group(1).strip() if nm_match else ""
                         return _safe_make_system(metals, nm)
@@ -460,13 +458,21 @@ def parse_system_from_csv(csv_path: Path) -> SystemSpec | None:
                         # sorted alphabetically (so different runs with same set
                         # produce the SAME SystemSpec regardless of fraction order)
                         bracket_metals = sorted(p[0] for p in pairs)
-                        metals = (metal_a,) + tuple(bracket_metals)
+                        metals = tuple(sorted(set([metal_a] + bracket_metals)))
                         return _safe_make_system(metals, nm)
                     log.debug("CSV %s has unparseable bracket content '%s'", csv_path.name, inner)
                     return None
                 # 4. Dash-separated form
                 if _DASH_SYSTEM_RE.match(label):
                     return _parse_dash_system(label)
+
+                # 5. Single compound fallback (e.g. "BW2" seed -> maybe pure W-B)
+                # This helps discover baseline points for aggregator.
+                try:
+                    return parse_system_from_string(label)
+                except ValueError:
+                    pass
+
                 log.debug("CSV %s has unrecognised system label '%s'", csv_path.name, label)
                 return None
     except (OSError, UnicodeDecodeError) as exc:
@@ -499,12 +505,12 @@ def parse_bracket_header_with_fractions(
                     return None
 
                 bracket_metals = sorted(p[0] for p in pairs)
-                metals = (metal_a,) + tuple(bracket_metals)
+                metals = tuple(sorted(set([metal_a] + bracket_metals)))
                 sys_spec = _safe_make_system(metals, nm)
                 if sys_spec is None:
                     return None
 
-                fracs = {metal_a: 1.0}
+                fracs = {}
                 for sym, frac in pairs:
                     fracs[sym] = frac
                 return sys_spec, fracs, metal_a # <-- Явно повертаємо metal_a
@@ -522,6 +528,8 @@ def parse_system_from_string(s: str) -> SystemSpec:
       'Ti-Nb-Zr-C'           → ternary metals + C
       'Ti-Nb-Zr-Hf-V-C'      → 5 metals + C
       'Ti(1-x)Nb(x)C'        → legacy binary VCA form
+      'W-B' or 'WB'          → unary metal + nonmetal
+      'W'                    → unary metal
 
     Whether the last token is a metal or nonmetal is decided by looking it
     up in config.ELEMENTS — if the entry has 'nonmetal': True (e.g. C, N, B),
@@ -540,9 +548,26 @@ def parse_system_from_string(s: str) -> SystemSpec:
     if "-" in s:
         return _parse_dash_system(s)
 
+    # 3. Compact form or single metal (e.g. "WB" or "Ti")
+    import re
+    # Match element pairs (e.g. "TiNb", "WB")
+    tokens = re.findall(r"([A-Z][a-z]?)", s)
+    if tokens:
+        elements = _elements()
+        metals = []
+        nonmetal = ""
+        for t in tokens:
+            if t in elements:
+                if elements[t].get("nonmetal"):
+                    nonmetal = t
+                else:
+                    metals.append(t)
+        if metals:
+            return _safe_make_system(tuple(metals), nonmetal)
+
     raise ValueError(
         f"Cannot parse system '{s}'. Expected formats: "
-        f"'Ti-Nb-C', 'Ti-Nb-Zr-C', 'Ti-Nb-Zr-Hf-V-C', or 'Ti(1-x)Nb(x)C'."
+        f"'Ti-Nb-C', 'Ti-Nb-Zr-C', 'W-B', 'WB', or 'Ti'."
     )
 
 
@@ -863,10 +888,10 @@ class DataIngestor:
             c = pd.to_numeric(df["concentration"], errors="coerce").to_numpy(dtype=float)
             cols: list[np.ndarray] = []
             for m in sys_spec.metals:
-                if m == bracket_metal_a: # <-- ВИПРАВЛЕНО: Чітка перевірка по імені металу
-                    cols.append((1.0 - c))
+                frac = float(bracket_fracs.get(m, 0.0))
+                if m == bracket_metal_a: # <-- ВИПРАВЛЕНО: Додаємо c * frac якщо метал є і в дужках
+                    cols.append((1.0 - c) + c * frac)
                 else:
-                    frac = float(bracket_fracs.get(m, 0.0))
                     cols.append(c * frac)
             x_matrix = np.column_stack(cols)
         elif sys_spec.is_binary() and "concentration" in df.columns:

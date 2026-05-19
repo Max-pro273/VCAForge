@@ -174,6 +174,7 @@ def _aggregate_if_configured(
     system: SystemSpec,
     target: str | None,
     mode: str | None,
+    crystal_mode: str | None = None,
 ) -> Path | None:
     if not _aggregate_on_iter():
         return None
@@ -184,7 +185,8 @@ def _aggregate_if_configured(
         return None
     try:
         agg = ResultAggregator(target=target, mode=mode or "maximize",
-                               dedupe_tol=_dedupe_tol())
+                               dedupe_tol=_dedupe_tol(),
+                               crystal_mode=crystal_mode)
         return agg.aggregate(base_dir, system)
     except (FileNotFoundError, ValueError) as exc:
         log.debug("Aggregation skipped (%s)", exc)
@@ -380,6 +382,7 @@ def run_loop(
             master = _aggregate_if_configured(
                 base_dir if base_dir else structure_file.parent,
                 target_sys, target, mode,
+                crystal_mode=crystal_mode,
             )
             if master:
                 print(f"  Master CSV updated: {master.name}")
